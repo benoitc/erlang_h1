@@ -1,0 +1,17 @@
+{application, h1,
+ [{description, "HTTP/1.1 protocol library for Erlang"},
+  {vsn, "0.1.0"},
+  {registered, [h1_sup]},
+  {mod, {h1_app, []}},
+  {applications,
+   [kernel,
+    stdlib,
+    ssl,
+    crypto,
+    public_key
+   ]},
+  {env, []},
+  {modules, []},
+  {licenses, ["Apache-2.0"]},
+  {links, [{"GitHub", "https://github.com/benoitc/erlang_h1"}]}
+ ]}.
