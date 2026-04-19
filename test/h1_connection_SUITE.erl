@@ -24,14 +24,20 @@
     client_closes_on_connection_close/1,
     upgrade_server_side/1,
     upgrade_client_side/1,
-    upgrade_capsule_exchange/1
+    upgrade_capsule_exchange/1,
+    idle_timeout_closes_silent_connection/1,
+    pipeline_disabled_returns_error/1,
+    client_auto_adds_host_header/1,
+    server_rejects_1_1_request_without_host_with_400/1,
+    close_delimited_response_terminates_on_eof/1
 ]).
 
 all() ->
     [{group, basic},
      {group, keepalive},
      {group, expect},
-     {group, upgrade}].
+     {group, upgrade},
+     {group, hardening}].
 
 groups() ->
     [{basic, [],
@@ -43,7 +49,13 @@ groups() ->
      {expect, [],
       [expect_100_continue]},
      {upgrade, [],
-      [upgrade_server_side, upgrade_client_side, upgrade_capsule_exchange]}].
+      [upgrade_server_side, upgrade_client_side, upgrade_capsule_exchange]},
+     {hardening, [],
+      [idle_timeout_closes_silent_connection,
+       pipeline_disabled_returns_error,
+       client_auto_adds_host_header,
+       server_rejects_1_1_request_without_host_with_400,
+       close_delimited_response_terminates_on_eof]}].
 
 init_per_suite(Config) -> Config.
 end_per_suite(_Config) -> ok.
@@ -346,6 +358,118 @@ upgrade_capsule_exchange(Config) ->
     ok.
 
 %% ----------------------------------------------------------------------------
+%% Cases: hardening (review batch)
+%% ----------------------------------------------------------------------------
+
+idle_timeout_closes_silent_connection(Config) ->
+    ClientSock = ?config(client_sock, Config),
+    {ok, Client} = h1_connection:start_link(
+        client, ClientSock, self(), #{idle_timeout => 100}),
+    ok = gen_tcp:controlling_process(ClientSock, Client),
+    ok = h1_connection:activate(Client),
+    %% No data → idle timer should fire and stop the connection.
+    %% terminate/3 emits a `{closed, Reason}' event with the stop reason.
+    ok = wait_for_closed(Client, idle_timeout, 2000),
+    catch h1_connection:close(Client).
+
+wait_for_closed(Conn, Tag, Timeout) ->
+    receive
+        {h1, Conn, connected} -> wait_for_closed(Conn, Tag, Timeout);
+        {h1, Conn, {closed, Tag}} -> ok;
+        {h1, Conn, {closed, {shutdown, Tag}}} -> ok
+    after Timeout -> ct:fail({no_closed, Tag, flush_messages()})
+    end.
+
+pipeline_disabled_returns_error(Config) ->
+    ClientSock = ?config(client_sock, Config),
+    ServerSock = ?config(server_sock, Config),
+    {ok, Client} = h1_connection:start_link(
+        client, ClientSock, self(), #{pipeline => false}),
+    {ok, Server} = h1_connection:start_link(
+        server, ServerSock, self(), #{}),
+    ok = gen_tcp:controlling_process(ClientSock, Client),
+    ok = gen_tcp:controlling_process(ServerSock, Server),
+    ok = h1_connection:activate(Client),
+    ok = h1_connection:activate(Server),
+    {ok, _} = h1_connection:send_request(Client, <<"GET">>, <<"/a">>,
+                                         [{<<"host">>, <<"x">>}], #{}),
+    %% Second request while first is in flight → rejected.
+    ?assertEqual({error, pipeline_disabled},
+                 h1_connection:send_request(Client, <<"GET">>, <<"/b">>,
+                                            [{<<"host">>, <<"x">>}], #{})),
+    stop_pair(Client, Server).
+
+client_auto_adds_host_header(Config) ->
+    ClientSock = ?config(client_sock, Config),
+    ServerSock = ?config(server_sock, Config),
+    {ok, Client} = h1_connection:start_link(
+        client, ClientSock, self(), #{peer_host => <<"example.test">>}),
+    {ok, Server} = h1_connection:start_link(
+        server, ServerSock, self(), #{}),
+    ok = gen_tcp:controlling_process(ClientSock, Client),
+    ok = gen_tcp:controlling_process(ServerSock, Server),
+    ok = h1_connection:activate(Client),
+    ok = h1_connection:activate(Server),
+    receive {h1, Client, connected} -> ok after 1000 -> ct:fail(no_client_connected) end,
+    receive {h1, Server, connected} -> ok after 1000 -> ct:fail(no_server_connected) end,
+    {ok, _} = h1_connection:send_request(Client, <<"GET">>, <<"/x">>,
+                                         [], #{}),
+    {request, _, <<"GET">>, <<"/x">>, Hs} = receive_h1(Server, 1000),
+    ?assertEqual(<<"example.test">>,
+                 proplists:get_value(<<"host">>, Hs)),
+    stop_pair(Client, Server).
+
+server_rejects_1_1_request_without_host_with_400(Config) ->
+    ServerSock = ?config(server_sock, Config),
+    ClientSock = ?config(client_sock, Config),
+    {ok, Server} = h1_connection:start_link(server, ServerSock, self(), #{}),
+    ok = gen_tcp:controlling_process(ServerSock, Server),
+    ok = h1_connection:activate(Server),
+    ok = gen_tcp:send(ClientSock, <<"GET / HTTP/1.1\r\n\r\n">>),
+    ok = inet:setopts(ClientSock, [{active, false}]),
+    {ok, Resp} = gen_tcp:recv(ClientSock, 0, 1000),
+    ?assertMatch(<<"HTTP/1.1 400 ", _/binary>>, Resp),
+    ?assertMatch({match, _}, re:run(Resp, <<"(?i)connection: close">>)),
+    catch h1_connection:close(Server).
+
+close_delimited_response_terminates_on_eof(Config) ->
+    ClientSock = ?config(client_sock, Config),
+    ServerSock = ?config(server_sock, Config),
+    {ok, Client} = h1_connection:start_link(client, ClientSock, self(), #{}),
+    ok = gen_tcp:controlling_process(ClientSock, Client),
+    ok = h1_connection:activate(Client),
+    receive {h1, Client, connected} -> ok after 1000 -> ct:fail(no_connected) end,
+    {ok, _} = h1_connection:send_request(Client, <<"GET">>, <<"/">>,
+                                         [{<<"host">>, <<"x">>}], #{}),
+    %% Consume the request bytes off the server socket.
+    ok = inet:setopts(ServerSock, [{active, false}]),
+    {ok, _} = gen_tcp:recv(ServerSock, 0, 1000),
+    %% Server writes a response with no Content-Length / Transfer-Encoding,
+    %% then closes the socket to delimit the body.
+    Resp = <<"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n",
+             "streaming payload">>,
+    ok = gen_tcp:send(ServerSock, Resp),
+    ok = gen_tcp:close(ServerSock),
+    %% Client should see headers, then body chunks, then a final
+    %% empty-data end marker plus the closed event.
+    {response, _, 200, _} = receive_h1(Client, 1000),
+    Body = collect_body(Client, <<>>),
+    ?assertEqual(<<"streaming payload">>, Body),
+    catch h1_connection:close(Client).
+
+collect_body(Conn, Acc) ->
+    receive
+        {h1, Conn, {data, _, D, false}} -> collect_body(Conn, <<Acc/binary, D/binary>>);
+        {h1, Conn, {data, _, D, true}}  -> <<Acc/binary, D/binary>>;
+        {h1, Conn, {closed, _}}         -> Acc;
+        {'EXIT', Conn, _}               -> Acc
+    after 1000 -> Acc
+    end.
+
+flush_messages() ->
+    receive M -> [M | flush_messages()] after 0 -> [] end.
+
+%% ----------------------------------------------------------------------------
 %% Helpers
 %% ----------------------------------------------------------------------------
 
@@ -412,7 +536,7 @@ collect_data_until_end(Conn, Acc) ->
         {h1, Conn, {data, _, Data, false}} ->
             collect_data_until_end(Conn, [Data | Acc]);
         {h1, Conn, {trailers, _, _}} ->
-            collect_data_until_end(Conn, Acc)
+            lists:reverse(Acc)
     after 1000 ->
         ct:fail({incomplete_body, lists:reverse(Acc)})
     end.

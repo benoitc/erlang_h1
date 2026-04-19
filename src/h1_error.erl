@@ -3,7 +3,7 @@
 %% H1 has no on-the-wire error code frame (unlike H2's RST_STREAM), so
 %% this module normalises the reason atoms the parser, connection, and
 %% encoder produce. Callers can map them to HTTP status codes or log
-%% messages via `format/1`.
+%% messages via `format/1'.
 -module(h1_error).
 
 -export([classify/1, format/1, status/1]).

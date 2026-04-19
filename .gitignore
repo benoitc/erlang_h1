@@ -6,3 +6,6 @@ erl_crash.dump
 .rebar3/
 logs/
 .DS_Store
+
+# ex_doc output (sources live under docs/)
+/doc/

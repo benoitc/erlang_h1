@@ -25,7 +25,11 @@
     encode_last_chunk/0, encode_last_chunk/1,
     %% Framing helpers
     choose_framing/2,
-    is_valid_header_value/1
+    is_valid_header_name/1,
+    is_valid_header_value/1,
+    is_valid_token/1,
+    is_valid_request_target/1,
+    is_valid_reason_phrase/1
 ]).
 
 -include("h1.hrl").
@@ -44,10 +48,32 @@ request_line(Method, Path, Version) ->
     request_line(Method, Path, <<>>, Version).
 
 -spec request_line(binary(), binary(), binary(), version()) -> iodata().
-request_line(Method, Path, <<>>, Version) ->
-    [Method, $\s, Path, $\s, version_bin(Version), "\r\n"];
 request_line(Method, Path, Qs, Version) ->
-    [Method, $\s, Path, $?, Qs, $\s, version_bin(Version), "\r\n"].
+    ok = check_token(Method, invalid_method),
+    ok = check_request_target(Path, invalid_path),
+    ok = check_request_target(Qs, invalid_query),
+    case Qs of
+        <<>> -> [Method, $\s, Path, $\s, version_bin(Version), "\r\n"];
+        _    -> [Method, $\s, Path, $?, Qs, $\s, version_bin(Version), "\r\n"]
+    end.
+
+check_token(Bin, Tag) ->
+    case is_valid_token(Bin) of
+        true  -> ok;
+        false -> error({Tag, Bin})
+    end.
+
+check_request_target(Bin, Tag) ->
+    case is_valid_request_target(Bin) of
+        true  -> ok;
+        false -> error({Tag, Bin})
+    end.
+
+check_reason(Bin) ->
+    case is_valid_reason_phrase(Bin) of
+        true  -> ok;
+        false -> error({invalid_reason_phrase, Bin})
+    end.
 
 %% ----------------------------------------------------------------------------
 %% Status line
@@ -59,6 +85,7 @@ status_line(Status, Version) ->
 
 -spec status_line(non_neg_integer(), binary(), version()) -> iodata().
 status_line(Status, Reason, Version) ->
+    ok = check_reason(Reason),
     [version_bin(Version), $\s, integer_to_binary(Status), $\s, Reason, "\r\n"].
 
 version_bin({1, 0}) -> <<"HTTP/1.0">>;
@@ -75,9 +102,10 @@ headers(Headers) ->
     [encode_header_kv(N, V) || {N, V} <- Headers].
 
 encode_header_kv(Name, Value) ->
-    case is_valid_header_value(Value) of
-        true -> [Name, <<": ">>, Value, <<"\r\n">>];
-        false -> error({invalid_header_value, Name})
+    case {is_valid_header_name(Name), is_valid_header_value(Value)} of
+        {true, true}  -> [Name, <<": ">>, Value, <<"\r\n">>];
+        {false, _}    -> error({invalid_header_name, Name});
+        {_, false}    -> error({invalid_header_value, Name})
     end.
 
 %% Reject CR/LF in header values (header injection guard).
@@ -86,6 +114,58 @@ is_valid_header_value(Bin) when is_binary(Bin) ->
     binary:match(Bin, [<<"\r">>, <<"\n">>]) =:= nomatch;
 is_valid_header_value(Value) ->
     is_valid_header_value(iolist_to_binary(Value)).
+
+%% RFC 9110 §5.1: field-name = token = 1*tchar. We reject any byte that
+%% isn't a printable ASCII tchar — this catches CR/LF injection but also
+%% space, colon, DEL, and control bytes.
+-spec is_valid_header_name(iodata()) -> boolean().
+is_valid_header_name(<<>>) -> false;
+is_valid_header_name(Bin) when is_binary(Bin) -> is_tchar_binary(Bin);
+is_valid_header_name(Name) -> is_valid_header_name(iolist_to_binary(Name)).
+
+-spec is_valid_token(iodata()) -> boolean().
+is_valid_token(<<>>) -> false;
+is_valid_token(Bin) when is_binary(Bin) -> is_tchar_binary(Bin);
+is_valid_token(Tok) -> is_valid_token(iolist_to_binary(Tok)).
+
+is_tchar_binary(<<>>) -> true;
+is_tchar_binary(<<C, Rest/binary>>) ->
+    case is_tchar(C) of
+        true  -> is_tchar_binary(Rest);
+        false -> false
+    end.
+
+%% RFC 9110 token character set.
+is_tchar(C) when C >= $0, C =< $9 -> true;
+is_tchar(C) when C >= $a, C =< $z -> true;
+is_tchar(C) when C >= $A, C =< $Z -> true;
+is_tchar($!) -> true; is_tchar($#) -> true; is_tchar($$) -> true;
+is_tchar($%) -> true; is_tchar($&) -> true; is_tchar($') -> true;
+is_tchar($*) -> true; is_tchar($+) -> true; is_tchar($-) -> true;
+is_tchar($.) -> true; is_tchar($^) -> true; is_tchar($_) -> true;
+is_tchar($`) -> true; is_tchar($|) -> true; is_tchar($~) -> true;
+is_tchar(_)  -> false.
+
+%% RFC 9112 §3.2 request-target — no CR/LF/SP in the serialized form.
+-spec is_valid_request_target(iodata()) -> boolean().
+is_valid_request_target(<<>>) -> true;
+is_valid_request_target(Bin) when is_binary(Bin) -> is_visible_ascii(Bin);
+is_valid_request_target(X) -> is_valid_request_target(iolist_to_binary(X)).
+
+is_visible_ascii(<<>>) -> true;
+is_visible_ascii(<<C, R/binary>>) when C > 32, C =/= 127 -> is_visible_ascii(R);
+is_visible_ascii(_) -> false.
+
+%% RFC 9110 §4.1 reason-phrase = *( HTAB / SP / VCHAR / obs-text )
+-spec is_valid_reason_phrase(iodata()) -> boolean().
+is_valid_reason_phrase(<<>>) -> true;
+is_valid_reason_phrase(Bin) when is_binary(Bin) -> is_reason_binary(Bin);
+is_valid_reason_phrase(X) -> is_valid_reason_phrase(iolist_to_binary(X)).
+
+is_reason_binary(<<>>) -> true;
+is_reason_binary(<<$\t, R/binary>>) -> is_reason_binary(R);
+is_reason_binary(<<C, R/binary>>) when C >= 32, C =/= 127 -> is_reason_binary(R);
+is_reason_binary(_) -> false.
 
 %% ----------------------------------------------------------------------------
 %% High-level encoders

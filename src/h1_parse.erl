@@ -5,7 +5,7 @@
 -module(h1_parse).
 
 %% Streaming API
--export([parser/0, parser/1, execute/1, execute/2, get/2]).
+-export([parser/0, parser/1, execute/1, execute/2, finish/1, get/2]).
 
 %% Stateless API
 -export([parse_request/1, parse_request/2]).
@@ -20,6 +20,7 @@ parser(Opts) -> h1_parse_erl:parser(Opts).
 
 execute(P) -> h1_parse_erl:execute(P).
 execute(P, Bin) -> h1_parse_erl:execute(P, Bin).
+finish(P) -> h1_parse_erl:finish(P).
 
 get(P, Prop) -> h1_parse_erl:get(P, Prop).
 

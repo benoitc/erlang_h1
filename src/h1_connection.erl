@@ -38,6 +38,7 @@
 -export([set_stream_handler/3, set_stream_handler/4, unset_stream_handler/2]).
 -export([controlling_process/2]).
 -export([get_settings/1, get_peer_settings/1]).
+-export([set_pipeline/2]).
 -export([close/1]).
 
 %% gen_statem callbacks
@@ -61,6 +62,7 @@
     version = ?HTTP_1_1   :: version(),
     req_headers = []      :: headers(),
     resp_headers = []     :: headers(),
+    trailers = []         :: headers(),
     %% Per-stream event handler (if set via set_stream_handler/3).
     handler               :: undefined | pid(),
     handler_opts = #{}    :: map(),
@@ -89,6 +91,9 @@
     owner                  :: pid(),
     owner_ref              :: reference(),
     peer                   :: {inet:ip_address(), inet:port_number()} | undefined,
+    %% Client-side: hostname (or IP literal) used to build the default
+    %% `Host:' header when the caller omits it.
+    peer_host              :: undefined | binary(),
     %% Parser.
     parser                 :: h1_parse_erl:parser(),
     %% Current in-flight stream on the wire.
@@ -220,9 +225,19 @@ get_settings(Pid) ->
 get_peer_settings(Pid) ->
     gen_statem:call(Pid, get_peer_settings).
 
+set_pipeline(Pid, Enabled) when is_boolean(Enabled) ->
+    gen_statem:call(Pid, {set_pipeline, Enabled}).
+
 close(Pid) ->
-    try gen_statem:stop(Pid, normal, 5000)
-    catch exit:noproc -> ok; exit:{noproc, _} -> ok
+    try gen_statem:stop(Pid, normal, 5000) of
+        ok -> ok
+    catch
+        exit:noproc      -> ok;
+        exit:{noproc, _} -> ok;
+        %% Process already terminated for some other reason (e.g. peer
+        %% closed the socket). Nothing to clean up; caller wanted it
+        %% gone and it is.
+        exit:_           -> ok
     end.
 
 %% ----------------------------------------------------------------------------
@@ -237,12 +252,18 @@ init({Mode, Socket, Owner, Opts}) ->
     Transport = transport_of(Socket),
     ParserOpts = parser_opts_from(Mode, Opts),
     Parser = h1_parse_erl:parser(ParserOpts),
+    PeerHost = case maps:get(peer_host, Opts, undefined) of
+        undefined -> undefined;
+        H when is_binary(H) -> H;
+        H when is_list(H)   -> iolist_to_binary(H)
+    end,
     State = #state{
         mode = Mode,
         socket = Socket,
         transport = Transport,
         owner = Owner,
         owner_ref = Ref,
+        peer_host = PeerHost,
         parser = Parser,
         parser_opts = ParserOpts,
         idle_timeout = maps:get(idle_timeout, Opts, 300000),
@@ -260,7 +281,7 @@ parser_base_opts(Type, Opts) ->
     [Type
      | [{K, V}
         || K <- [max_line_length, max_empty_lines, max_header_name_size,
-                 max_header_value_size, max_headers],
+                 max_header_value_size, max_headers, max_body_size],
            V <- [maps:get(K, Opts, undefined)],
            V =/= undefined]].
 
@@ -275,7 +296,8 @@ transport_of(Socket) ->
 handle_event({call, From}, activate, idle, State) ->
     State1 = set_active_once(State),
     State2 = maybe_notify_connected(State1),
-    {next_state, open, State2, [{reply, From, ok}]};
+    Actions = [{reply, From, ok} | idle_timeout_actions(State2)],
+    {next_state, open, State2, Actions};
 handle_event({call, From}, wait_connected, idle,
              #state{wait_connected_waiters = W} = State) ->
     Ref = make_ref(),
@@ -304,6 +326,13 @@ handle_event(info, {tcp_error, Sock, Reason}, _S, #state{socket = Sock} = State)
     handle_socket_closed(State, {closed, Reason});
 handle_event(info, {ssl_error, Sock, Reason}, _S, #state{socket = Sock} = State) ->
     handle_socket_closed(State, {closed, Reason});
+
+%% --- timers -----------------------------------------------------------------
+
+handle_event({timeout, idle}, idle, _S, State) ->
+    {stop, {shutdown, idle_timeout}, State};
+handle_event({timeout, request}, request, _S, State) ->
+    {stop, {shutdown, request_timeout}, State};
 
 %% --- owner lifecycle --------------------------------------------------------
 
@@ -399,6 +428,9 @@ handle_event({call, From}, get_settings, _S, _State) ->
     {keep_state_and_data, [{reply, From, #{}}]};
 handle_event({call, From}, get_peer_settings, _S, _State) ->
     {keep_state_and_data, [{reply, From, #{}}]};
+handle_event({call, From}, {set_pipeline, Enabled}, _S, State) ->
+    {keep_state, State#state{pipeline_enabled = Enabled},
+     [{reply, From, ok}]};
 
 handle_event({call, From}, activate, open, _State) ->
     {keep_state_and_data, [{reply, From, ok}]};
@@ -459,6 +491,25 @@ notify(Owner, Event, Conn) ->
     Owner ! {h1, Conn, Event},
     ok.
 
+%% Generic gen_statem timeouts. Re-emitting `{{timeout, Name}, Time, _}'
+%% cancels and re-arms; `infinity' cancels without re-arming.
+idle_timeout_actions(#state{idle_timeout = infinity}) ->
+    [{{timeout, idle}, infinity, idle}];
+idle_timeout_actions(#state{idle_timeout = Ms}) when is_integer(Ms), Ms > 0 ->
+    [{{timeout, idle}, Ms, idle}];
+idle_timeout_actions(_) ->
+    [{{timeout, idle}, infinity, idle}].
+
+request_timeout_actions(#state{request_timeout = infinity}) ->
+    [{{timeout, request}, infinity, request}];
+request_timeout_actions(#state{request_timeout = Ms}) when is_integer(Ms), Ms > 0 ->
+    [{{timeout, request}, Ms, request}];
+request_timeout_actions(_) ->
+    [{{timeout, request}, infinity, request}].
+
+clear_request_timeout() ->
+    [{{timeout, request}, infinity, request}].
+
 %% ----------------------------------------------------------------------------
 %% Parser drive
 %% ----------------------------------------------------------------------------
@@ -466,7 +517,9 @@ notify(Owner, Event, Conn) ->
 handle_socket_data(Data, #state{parser = P, mode = Mode} = State) ->
     case drive_parser(h1_parse_erl:execute(P, Data), State, Mode) of
         {ok, State1} ->
-            {keep_state, set_active_once(State1)};
+            Actions = idle_timeout_actions(State1)
+                      ++ request_timer_actions(State1),
+            {keep_state, set_active_once(State1), Actions};
         {upgrade_client, Stream, NewParser, State1} ->
             complete_client_upgrade(Stream, NewParser, State1);
         {closed, Reason, State1} ->
@@ -474,6 +527,17 @@ handle_socket_data(Data, #state{parser = P, mode = Mode} = State) ->
         {error, Reason, State1} ->
             {stop, {shutdown, Reason}, State1}
     end.
+
+%% Re-arm request timer if a request is in flight, cancel otherwise.
+request_timer_actions(#state{mode = client, pending = Q} = State) ->
+    case queue:is_empty(Q) of
+        true  -> clear_request_timeout();
+        false -> request_timeout_actions(State)
+    end;
+request_timer_actions(#state{mode = server, current_stream = undefined}) ->
+    clear_request_timeout();
+request_timer_actions(#state{mode = server} = State) ->
+    request_timeout_actions(State).
 
 drive_parser({more, P}, State, _Mode) ->
     {ok, State#state{parser = P}};
@@ -561,8 +625,8 @@ accumulate_trailer({Name, Value}, #state{current_stream = Id} = State)
     when Id =/= undefined ->
     case maps:find(Id, State#state.streams) of
         {ok, Stream} ->
-            Trailers = [{Name, Value} | Stream#stream.resp_headers],
-            put_stream(Stream#stream{resp_headers = Trailers}, State);
+            Trailers = [{Name, Value} | Stream#stream.trailers],
+            put_stream(Stream#stream{trailers = Trailers}, State);
         error -> State
     end.
 
@@ -572,28 +636,13 @@ on_headers_complete(#state{mode = server, current_stream = Id} = State, server) 
     Stream0 = maps:get(Id, State#state.streams),
     Headers = lists:reverse(Stream0#stream.req_headers),
     Stream1 = Stream0#stream{req_headers = Headers},
-    %% Detect Upgrade.
-    case detect_upgrade(State#state.parser, Headers) of
-        {upgrade, Proto} ->
-            Stream2 = Stream1#stream{state = half_closed_remote},
-            State1 = put_stream(Stream2, State),
-            notify(State1#state.owner,
-                   {upgrade, Id, Proto, Stream1#stream.method,
-                    Stream1#stream.path, Headers}, self()),
+    %% RFC 9110 §7.2: HTTP/1.1 requests MUST include a Host header.
+    case missing_host_on_http_1_1(Stream1, Headers) of
+        true ->
+            State1 = send_400_missing_host(Stream1, State),
             {pause, State1};
-        no_upgrade ->
-            %% Expect: 100-continue?
-            Expect = h1_parse_erl:get(State#state.parser, expect),
-            HasExpect = Expect =:= <<"100-continue">>,
-            Stream2 = Stream1#stream{expect_continue = HasExpect},
-            State1 = put_stream(Stream2, State),
-            notify(State1#state.owner,
-                   {request, Id, Stream1#stream.method,
-                    Stream1#stream.path, Headers}, self()),
-            %% Update keepalive flag from request.
-            State2 = apply_peer_connection_policy(State1, Headers,
-                        Stream1#stream.version),
-            {continue, State2}
+        false ->
+            on_request_headers_complete(Stream1, Headers, State, Id)
     end;
 on_headers_complete(#state{mode = client, current_stream = Id} = State, client) ->
     Stream0 = maps:get(Id, State#state.streams),
@@ -624,6 +673,47 @@ on_headers_complete(#state{mode = client, current_stream = Id} = State, client) 
                         Stream1#stream.version),
             {continue, State2}
     end.
+
+on_request_headers_complete(Stream1, Headers, State, Id) ->
+    case detect_upgrade(State#state.parser, Headers) of
+        {upgrade, Proto} ->
+            Stream2 = Stream1#stream{state = half_closed_remote},
+            State1 = put_stream(Stream2, State),
+            notify(State1#state.owner,
+                   {upgrade, Id, Proto, Stream1#stream.method,
+                    Stream1#stream.path, Headers}, self()),
+            {pause, State1};
+        no_upgrade ->
+            Expect = h1_parse_erl:get(State#state.parser, expect),
+            HasExpect = Expect =:= <<"100-continue">>,
+            Stream2 = Stream1#stream{expect_continue = HasExpect},
+            State1 = put_stream(Stream2, State),
+            notify(State1#state.owner,
+                   {request, Id, Stream1#stream.method,
+                    Stream1#stream.path, Headers}, self()),
+            State2 = apply_peer_connection_policy(State1, Headers,
+                        Stream1#stream.version),
+            {continue, State2}
+    end.
+
+missing_host_on_http_1_1(#stream{version = {1, 1}}, Headers) ->
+    lookup_ci(<<"host">>, Headers) =:= undefined;
+missing_host_on_http_1_1(_, _) ->
+    false.
+
+send_400_missing_host(#stream{id = Id} = Stream, State) ->
+    Body = <<"Bad Request: missing Host header">>,
+    Wire = [h1_message:status_line(400, ?HTTP_1_1),
+            h1_message:headers([{<<"content-length">>,
+                                 integer_to_binary(byte_size(Body))},
+                                {<<"connection">>, <<"close">>},
+                                {<<"content-type">>, <<"text/plain">>}]),
+            <<"\r\n">>, Body],
+    _ = sock_send(State, Wire),
+    State1 = put_stream(Stream#stream{state = closed,
+                                      closed_reason = bad_request}, State),
+    State1#state{close_after = true, current_stream = undefined,
+                 streams = maps:remove(Id, State1#state.streams)}.
 
 detect_upgrade(Parser, Headers) ->
     Upgrade = h1_parse_erl:get(Parser, upgrade),
@@ -740,25 +830,31 @@ after_message_done(Rest, #state{mode = client, current_stream = Id} = State) ->
 finalize_request(Id, State) ->
     case maps:find(Id, State#state.streams) of
         {ok, Stream} ->
-            State1 = case Stream#stream.recv_ended orelse Stream#stream.state =:= closed of
-                true -> State;
+            State1 = emit_trailers_if_any(Id, Stream, State),
+            Stream0 = maps:get(Id, State1#state.streams, Stream),
+            State2 = case Stream0#stream.recv_ended orelse Stream0#stream.state =:= closed of
+                true -> State1;
                 false ->
-                    emit_to_owner_or_handler(Stream,
-                        {data, Id, <<>>, true}, State)
+                    emit_to_owner_or_handler(Stream0,
+                        {data, Id, <<>>, true}, State1)
             end,
-            Stream1 = (maps:get(Id, State1#state.streams, Stream))#stream{
+            Stream1 = (maps:get(Id, State2#state.streams, Stream0))#stream{
                 state = half_closed_remote, recv_ended = true},
-            State2 = put_stream(Stream1, State1),
-            State2#state{requests_served = State2#state.requests_served + 1};
+            State3 = put_stream(Stream1, State2),
+            State3#state{requests_served = State3#state.requests_served + 1};
         error -> State
     end.
 
 finalize_response(Id, State) ->
-    State1 = case maps:find(Id, State#state.streams) of
-        {ok, #stream{recv_ended = true}} -> State;
-        {ok, Stream} ->
-            emit_to_owner_or_handler(Stream, {data, Id, <<>>, true}, State);
+    State0 = case maps:find(Id, State#state.streams) of
+        {ok, Stream0} -> emit_trailers_if_any(Id, Stream0, State);
         error -> State
+    end,
+    State1 = case maps:find(Id, State0#state.streams) of
+        {ok, #stream{recv_ended = true}} -> State0;
+        {ok, Stream} ->
+            emit_to_owner_or_handler(Stream, {data, Id, <<>>, true}, State0);
+        error -> State0
     end,
     State2 = State1#state{
         streams = maps:remove(Id, State1#state.streams),
@@ -772,6 +868,14 @@ finalize_response(Id, State) ->
                 false -> State2#state{requests_served = State2#state.requests_served + 1}
             end
     end.
+
+emit_trailers_if_any(_Id, #stream{trailers = []}, State) -> State;
+emit_trailers_if_any(Id, #stream{trailers = Trs} = Stream, State) ->
+    Ordered = lists:reverse(Trs),
+    State1 = emit_to_owner_or_handler(Stream, {trailers, Id, Ordered}, State),
+    Stream1 = (maps:get(Id, State1#state.streams, Stream))#stream{
+        trailers = [], recv_ended = true},
+    put_stream(Stream1, State1).
 
 mark_stream_ended(#state{current_stream = Id} = State) when Id =/= undefined ->
     case maps:find(Id, State#state.streams) of
@@ -814,7 +918,29 @@ reset_parser_for_response(State, Id) ->
 %% Client: send_request
 %% ----------------------------------------------------------------------------
 
+handle_send_request(From, Method, Path, Headers, Opts,
+                    #state{pipeline_enabled = false, pending = Q} = State) ->
+    case queue:is_empty(Q) of
+        false -> {keep_state_and_data,
+                  [{reply, From, {error, pipeline_disabled}}]};
+        true  ->
+            handle_send_request_ok(From, Method, Path,
+                                   inject_host(Headers, State), Opts, State)
+    end;
 handle_send_request(From, Method, Path, Headers, Opts, State) ->
+    handle_send_request_ok(From, Method, Path,
+                           inject_host(Headers, State), Opts, State).
+
+inject_host(Headers, #state{mode = client, peer_host = Host})
+    when is_binary(Host), Host =/= <<>> ->
+    case lookup_ci(<<"host">>, Headers) of
+        undefined -> [{<<"host">>, Host} | Headers];
+        _         -> Headers
+    end;
+inject_host(Headers, _State) ->
+    Headers.
+
+handle_send_request_ok(From, Method, Path, Headers, Opts, State) ->
     Id = State#state.next_stream_id,
     Body = maps:get(body, Opts, no_body),
     EndStream = maps:get(end_stream, Opts, Body =/= no_body),
@@ -862,7 +988,9 @@ handle_send_request(From, Method, Path, Headers, Opts, State) ->
                 1 -> State1#state{parser = reset_parser(State1)};
                 _ -> State1
             end,
-            {keep_state, State2, [{reply, From, {ok, Id}}]};
+            Actions = [{reply, From, {ok, Id}}
+                       | request_timeout_actions(State2)],
+            {keep_state, State2, Actions};
         {error, R} ->
             {keep_state_and_data, [{reply, From, {error, R}}]}
     end.
@@ -1159,6 +1287,36 @@ split_path(URI) ->
         [P, Q] -> {P, Q}
     end.
 
-handle_socket_closed(#state{owner = Owner} = State, Reason) ->
-    notify(Owner, {closed, Reason}, self()),
+handle_socket_closed(#state{} = State0, Reason) ->
+    %% RFC 9112 §6.3 item 7: a close-delimited response body is bounded
+    %% by the socket close — finalize the parser and emit the final
+    %% end-of-stream data event to the owner before declaring the
+    %% connection closed. If the parser was in the middle of a framed
+    %% body, signal truncation via `{closed, {incomplete_body, _}}'.
+    State = maybe_finalize_close_delimited(State0, Reason),
+    notify(State#state.owner, {closed, Reason}, self()),
     {stop, {shutdown, Reason}, State}.
+
+maybe_finalize_close_delimited(#state{mode = client,
+                                      current_stream = Id,
+                                      parser = P} = State,
+                               _Reason) when Id =/= undefined ->
+    case h1_parse_erl:get(P, body_framing) of
+        close_delimited ->
+            case h1_parse_erl:finish(P) of
+                {done, _} ->
+                    case maps:find(Id, State#state.streams) of
+                        {ok, Stream} ->
+                            St1 = emit_to_owner_or_handler(
+                                    Stream, {data, Id, <<>>, true}, State),
+                            St2 = put_stream(
+                                    Stream#stream{recv_ended = true}, St1),
+                            St2;
+                        error -> State
+                    end;
+                _ -> State
+            end;
+        _ -> State
+    end;
+maybe_finalize_close_delimited(State, _) ->
+    State.

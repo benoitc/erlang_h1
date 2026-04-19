@@ -15,6 +15,7 @@
 -define(H1_MAX_BODY_SIZE,         8388608).   %% 8 MB
 -define(H1_MAX_LINE_LENGTH,       16384).     %% hackney default
 -define(H1_MAX_EMPTY_LINES,       10).
+-define(H1_MAX_CHUNK_SIZE_HEX,    16).         %% 64-bit max, way past any legit chunk
 
 %% ----------------------------------------------------------------------------
 %% HTTP versions
@@ -39,25 +40,34 @@
     %% Parsed metadata
     version          = undefined :: undefined | {non_neg_integer(), non_neg_integer()},
     method           = undefined :: undefined | binary(),
+    status           = undefined :: undefined | 100..599,
     partial_headers  = []        :: [{binary(), binary()}],
-    %% Fast-path header values (lowercased where noted)
-    clen             = undefined :: undefined | non_neg_integer() | bad_int,
+    %% Fast-path header values (lowercased where noted).
+    %% `clen' transitions: undefined -> N  (first valid value)
+    %%                      N         -> N          (duplicate same value)
+    %%                      N         -> conflict   (differing value)
+    %%                      _         -> bad_int    (unparsable)
+    clen             = undefined :: undefined | non_neg_integer() | bad_int | conflict,
     te               = undefined :: undefined | binary(),   %% lowercased
     connection       = undefined :: undefined | binary(),   %% lowercased
     ctype            = undefined :: undefined | binary(),   %% lowercased
-    location         = undefined :: undefined | binary(),
-    content_encoding = undefined :: undefined | binary(),   %% lowercased
     upgrade          = undefined :: undefined | binary(),   %% lowercased
     expect           = undefined :: undefined | binary(),   %% lowercased
+    %% Framing decision computed at end-of-headers.
+    body_framing     = undefined :: undefined | no_body
+                                  | {content_length, non_neg_integer()}
+                                  | chunked | close_delimited,
     %% Body decoder state
     body_state       = waiting :: waiting | done
                                 | {stream, fun(), term(), fun()},
+    body_read        = 0 :: non_neg_integer(),
     %% Limits
     max_line_length  = ?H1_MAX_LINE_LENGTH   :: pos_integer(),
     max_empty_lines  = ?H1_MAX_EMPTY_LINES   :: non_neg_integer(),
     max_header_name_size  = ?H1_MAX_HEADER_NAME_SIZE  :: pos_integer(),
     max_header_value_size = ?H1_MAX_HEADER_VALUE_SIZE :: pos_integer(),
     max_headers      = ?H1_MAX_HEADERS       :: pos_integer(),
+    max_body_size    = ?H1_MAX_BODY_SIZE     :: pos_integer() | infinity,
     %% Counters
     empty_lines      = 0       :: non_neg_integer(),
     header_count     = 0       :: non_neg_integer()

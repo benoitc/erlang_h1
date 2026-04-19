@@ -32,7 +32,7 @@
 -module(h1_parse_erl).
 
 -export([parser/0, parser/1]).
--export([execute/1, execute/2]).
+-export([execute/1, execute/2, finish/1]).
 -export([get/2]).
 
 %% Stateless convenience wrappers (livery-style).
@@ -58,7 +58,10 @@
                        | {max_empty_lines, non_neg_integer()}
                        | {max_header_name_size, pos_integer()}
                        | {max_header_value_size, pos_integer()}
-                       | {max_headers, pos_integer()}.
+                       | {max_headers, pos_integer()}
+                       | {max_body_size, pos_integer() | infinity}
+                       | {method, binary()}
+                       | {status, 100..599}.
 
 -type body_result() :: {ok, binary(), parser()}
                      | {trailer, {binary(), binary()}, parser()}
@@ -107,6 +110,15 @@ apply_options([{max_header_value_size, N} | R], St) when is_integer(N), N > 0 ->
     apply_options(R, St#h1_parser{max_header_value_size = N});
 apply_options([{max_headers, N} | R], St) when is_integer(N), N > 0 ->
     apply_options(R, St#h1_parser{max_headers = N});
+apply_options([{method, M} | R], St) when is_binary(M) ->
+    apply_options(R, St#h1_parser{method = M});
+apply_options([{status, S} | R], St)
+    when is_integer(S), S >= 100, S =< 599 ->
+    apply_options(R, St#h1_parser{status = S});
+apply_options([{max_body_size, N} | R], St) when is_integer(N), N > 0 ->
+    apply_options(R, St#h1_parser{max_body_size = N});
+apply_options([{max_body_size, infinity} | R], St) ->
+    apply_options(R, St#h1_parser{max_body_size = infinity});
 apply_options([_ | R], St) ->
     apply_options(R, St).
 
@@ -126,9 +138,9 @@ get_prop(transfer_encoding, #h1_parser{te = TE}) -> TE;
 get_prop(content_length, #h1_parser{clen = C}) -> C;
 get_prop(connection, #h1_parser{connection = C}) -> C;
 get_prop(content_type, #h1_parser{ctype = C}) -> C;
-get_prop(location, #h1_parser{location = L}) -> L;
-get_prop(content_encoding, #h1_parser{content_encoding = C}) -> C;
 get_prop(upgrade, #h1_parser{upgrade = U}) -> U;
+get_prop(status, #h1_parser{status = S}) -> S;
+get_prop(body_framing, #h1_parser{body_framing = F}) -> F;
 get_prop(expect, #h1_parser{expect = E}) -> E;
 get_prop(headers, #h1_parser{partial_headers = H}) -> lists:reverse(H).
 
@@ -281,6 +293,7 @@ parse_reason_phrase(Reason, St, Version, CodeBin) ->
         {ok, Status} when Status >= 100, Status =< 599 ->
             NSt = St#h1_parser{type = response,
                                version = Version,
+                               status = Status,
                                state = on_header,
                                partial_headers = []},
             {response, Version, Status, Reason, NSt};
@@ -316,22 +329,24 @@ parse_header_line(Sep, #h1_parser{buffer = B} = St) ->
                 {error, _} = E -> E
             end;
         [Line, <<$\s, Tail/binary>>] ->
-            %% Obsolete line folding; join and retry.
-            parse_header_line(Sep, St#h1_parser{
-                buffer = iolist_to_binary([Line, $\s, Tail])});
+            obs_fold(Sep, Line, Tail, St);
         [Line, <<$\t, Tail/binary>>] ->
-            parse_header_line(Sep, St#h1_parser{
-                buffer = iolist_to_binary([Line, $\s, Tail])});
+            obs_fold(Sep, Line, Tail, St);
         [Line, Rest] ->
             case split_header(Line) of
-                {ok, Key, Value} ->
-                    ValidName = valid_header_name(Key),
-                    case {ValidName, byte_size(Key), byte_size(Value)} of
+                {ok, Key0, Value} ->
+                    ValidName = valid_header_name(Key0),
+                    case {ValidName, byte_size(Key0), byte_size(Value)} of
                         {true, KN, _} when KN > (St#h1_parser.max_header_name_size) ->
                             {error, header_name_too_long};
                         {true, _, VN} when VN > (St#h1_parser.max_header_value_size) ->
                             {error, header_value_too_long};
                         {true, _, _} ->
+                            %% Normalize to lowercase so callers can do
+                            %% simple proplists lookups and the event
+                            %% shape matches h2 (which requires lowercase
+                            %% header names on the wire).
+                            Key = to_lower(Key0),
                             St1 = absorb_header(Key, Value,
                                                 St#h1_parser{buffer = Rest,
                                                              header_count =
@@ -345,6 +360,18 @@ parse_header_line(Sep, #h1_parser{buffer = B} = St) ->
             end;
         [B] ->
             {more, St}
+    end.
+
+%% RFC 9112 §5.3: accept obs-fold by rewriting to a single space, but
+%% re-check that the folded header doesn't sneak past max_header_value_size.
+obs_fold(Sep, Line, Tail, St) ->
+    Max = St#h1_parser.max_header_value_size,
+    Folded = iolist_to_binary([Line, $\s, Tail]),
+    %% Upper bound: a single header value can't exceed the full folded
+    %% first line length minus `Name:' minimum overhead. Cheap guard.
+    case byte_size(Folded) > Max + St#h1_parser.max_header_name_size + 2 of
+        true  -> {error, header_value_too_long};
+        false -> parse_header_line(Sep, St#h1_parser{buffer = Folded})
     end.
 
 split_header(Line) ->
@@ -375,114 +402,174 @@ absorb_header(Key, Value, St) ->
     update_fast_path(Key, Value, St1).
 
 %% Byte-size dispatch avoids to_lower/1 on every header (hackney trick).
+%% Key is already lowercased before we get here, so the per-bucket
+%% clauses just pattern-match the expected binary directly.
 update_fast_path(Key, Value, St) ->
     case byte_size(Key) of
         14 -> maybe_set_clen(Key, Value, St);
         17 -> maybe_set_te(Key, Value, St);
         10 -> maybe_set_connection(Key, Value, St);
         12 -> maybe_set_ctype(Key, Value, St);
-        8  -> maybe_set_location(Key, Value, St);
-        16 -> maybe_set_ce(Key, Value, St);
         7  -> maybe_set_upgrade(Key, Value, St);
         6  -> maybe_set_expect(Key, Value, St);
         _  -> St
     end.
 
-maybe_set_clen(K, V, St) ->
-    case to_lower(K) of
-        <<"content-length">> ->
-            case to_int(V) of
-                {ok, N} when N >= 0 -> St#h1_parser{clen = N};
-                _ -> St#h1_parser{clen = bad_int}
+%% RFC 9110 §8.6 / RFC 9112 §6.3: a single Content-Length header with a
+%% list of mismatched values (`5, 7'), or multiple Content-Length
+%% headers carrying different values, MUST be rejected. Duplicates with
+%% matching values are allowed and collapse to a single value.
+maybe_set_clen(<<"content-length">>, V, St) ->
+    case parse_clen_value(V) of
+        {ok, N}      -> fold_clen(N, St);
+        bad_int      -> St#h1_parser{clen = bad_int};
+        conflict     -> St#h1_parser{clen = conflict}
+    end;
+maybe_set_clen(_, _, St) -> St.
+
+parse_clen_value(V) ->
+    Parts = [trim(P) || P <- binary:split(V, <<",">>, [global])],
+    parse_clen_parts(Parts, undefined).
+
+parse_clen_parts([], Acc) -> {ok, Acc};
+parse_clen_parts([P | Rest], Acc) ->
+    case to_int(P) of
+        {ok, N} when N >= 0 ->
+            case Acc of
+                undefined -> parse_clen_parts(Rest, N);
+                N         -> parse_clen_parts(Rest, N);
+                _Other    -> conflict
             end;
-        _ -> St
+        _ ->
+            bad_int
     end.
 
-maybe_set_te(K, V, St) ->
-    case to_lower(K) of
-        <<"transfer-encoding">> -> St#h1_parser{te = to_lower(V)};
-        _ -> St
-    end.
+fold_clen(N, #h1_parser{clen = undefined} = St) -> St#h1_parser{clen = N};
+fold_clen(N, #h1_parser{clen = N} = St)         -> St;
+fold_clen(_, #h1_parser{clen = bad_int}  = St)  -> St;
+fold_clen(_, #h1_parser{} = St)                 -> St#h1_parser{clen = conflict}.
 
-maybe_set_connection(K, V, St) ->
-    case to_lower(K) of
-        <<"connection">> -> St#h1_parser{connection = to_lower(V)};
-        _ -> St
-    end.
+maybe_set_te(<<"transfer-encoding">>, V, St) ->
+    St#h1_parser{te = to_lower(V)};
+maybe_set_te(_, _, St) -> St.
 
-maybe_set_ctype(K, V, St) ->
-    case to_lower(K) of
-        <<"content-type">> -> St#h1_parser{ctype = to_lower(V)};
-        _ -> St
-    end.
+maybe_set_connection(<<"connection">>, V, St) ->
+    St#h1_parser{connection = to_lower(V)};
+maybe_set_connection(_, _, St) -> St.
 
-maybe_set_location(K, V, St) ->
-    case to_lower(K) of
-        <<"location">> -> St#h1_parser{location = V};
-        _ -> St
-    end.
+maybe_set_ctype(<<"content-type">>, V, St) ->
+    St#h1_parser{ctype = to_lower(V)};
+maybe_set_ctype(_, _, St) -> St.
 
-maybe_set_ce(K, V, St) ->
-    case to_lower(K) of
-        <<"content-encoding">> -> St#h1_parser{content_encoding = to_lower(V)};
-        _ -> St
-    end.
+maybe_set_upgrade(<<"upgrade">>, V, St) ->
+    St#h1_parser{upgrade = to_lower(V)};
+maybe_set_upgrade(_, _, St) -> St.
 
-maybe_set_upgrade(K, V, St) ->
-    case to_lower(K) of
-        <<"upgrade">> -> St#h1_parser{upgrade = to_lower(V)};
-        _ -> St
-    end.
+maybe_set_expect(<<"expect">>, V, St) ->
+    St#h1_parser{expect = to_lower(V)};
+maybe_set_expect(_, _, St) -> St.
 
-maybe_set_expect(K, V, St) ->
-    case to_lower(K) of
-        <<"expect">> -> St#h1_parser{expect = to_lower(V)};
-        _ -> St
-    end.
-
+%% RFC 9112 §6.1: a Content-Length that differs between occurrences is
+%% a smuggling vector — reject.
+finalize_headers(#h1_parser{clen = conflict}) ->
+    {error, conflicting_content_length};
 %% RFC 9112 §6.1: Content-Length + Transfer-Encoding on the same message
 %% must be rejected. Prevents request smuggling.
 finalize_headers(#h1_parser{te = TE, clen = CL} = St)
     when TE =/= undefined, CL =/= undefined, CL =/= bad_int ->
     case has_chunked(TE) of
-        true -> {error, conflicting_framing};
-        false -> {ok, St}
+        true  -> {error, conflicting_framing};
+        false -> finalize_framing(St)
     end;
 finalize_headers(#h1_parser{clen = bad_int}) ->
     {error, bad_request};
+%% RFC 9112 §6.1: HTTP/1.0 senders MUST NOT use Transfer-Encoding.
+finalize_headers(#h1_parser{version = {1, 0}, te = TE})
+    when TE =/= undefined ->
+    {error, te_on_http_1_0};
 finalize_headers(St) ->
-    {ok, St}.
+    finalize_framing(St).
 
 has_chunked(TE) ->
     %% Transfer-Encoding may be a list: "gzip, chunked".
     lists:any(fun(X) -> trim(X) =:= <<"chunked">> end,
               binary:split(TE, <<",">>, [global])).
 
+%% Compute the single framing decision used by parse_body. Called once
+%% at end-of-headers so the body loop has a tight dispatch.
+finalize_framing(#h1_parser{} = St) ->
+    {ok, St#h1_parser{body_framing = pick_framing(St)}}.
+
+pick_framing(#h1_parser{type = request, clen = CL, te = TE}) ->
+    %% RFC 9112 §6.3: absent both framing headers, a request body is empty.
+    case {TE, CL} of
+        {undefined, undefined} -> no_body;
+        {undefined, 0}         -> no_body;
+        {undefined, N} when is_integer(N) -> {content_length, N};
+        {_, _} ->
+            case has_chunked(TE) of
+                true  -> chunked;
+                false -> {content_length, default_cl(CL)}
+            end
+    end;
+pick_framing(#h1_parser{type = response, method = Method, status = Status,
+                        clen = CL, te = TE}) ->
+    %% RFC 9112 §6.3: no body for HEAD / 1xx / 204 / 304, regardless of
+    %% framing headers. Protects the client from buggy servers that send
+    %% Content-Length: N on a bodyless status.
+    case no_body_response(Method, Status) of
+        true  -> no_body;
+        false ->
+            case {TE, CL} of
+                {TE, _} when TE =/= undefined ->
+                    case has_chunked(TE) of
+                        true  -> chunked;
+                        false -> close_delimited
+                    end;
+                {_, 0}                              -> no_body;
+                {_, N} when is_integer(N), N > 0    -> {content_length, N};
+                {undefined, undefined}              -> close_delimited
+            end
+    end;
+pick_framing(#h1_parser{}) ->
+    %% auto-mode parser at body time shouldn't happen; treat as no body.
+    no_body.
+
+no_body_response(<<"HEAD">>, _)                         -> true;
+no_body_response(_, Status) when is_integer(Status),
+                                 Status >= 100,
+                                 Status < 200           -> true;
+no_body_response(_, 204)                                -> true;
+no_body_response(_, 304)                                -> true;
+no_body_response(_, _)                                  -> false.
+
+default_cl(undefined) -> 0;
+default_cl(N) when is_integer(N) -> N.
+
 %% ----------------------------------------------------------------------------
 %% Body
 %% ----------------------------------------------------------------------------
 
-parse_body(#h1_parser{method = <<"HEAD">>, buffer = B}) ->
-    %% No body on HEAD response.
+parse_body(#h1_parser{body_framing = no_body, buffer = B}) ->
     {done, B};
-parse_body(#h1_parser{body_state = waiting, te = TE} = St) ->
-    case has_chunked_safe(TE) of
-        true ->
-            parse_body(St#h1_parser{body_state =
-                {stream, fun te_chunked/2, waiting_size, fun ce_identity/1}});
-        false ->
-            case St#h1_parser.clen of
-                undefined ->
-                    {done, St#h1_parser.buffer};
-                0 ->
-                    {done, St#h1_parser.buffer};
-                bad_int ->
-                    {error, bad_request};
-                N when is_integer(N), N > 0 ->
-                    parse_body(St#h1_parser{body_state =
-                        {stream, fun te_identity/2, {0, N}, fun ce_identity/1}})
-            end
-    end;
+parse_body(#h1_parser{body_framing = undefined} = St) ->
+    %% Compute lazily if finalize_framing wasn't called (auto mode).
+    parse_body(St#h1_parser{body_framing = pick_framing(St)});
+parse_body(#h1_parser{body_state = waiting, body_framing = chunked} = St) ->
+    parse_body(St#h1_parser{body_state =
+        {stream, fun te_chunked/2, waiting_size, fun ce_identity/1}});
+parse_body(#h1_parser{body_state = waiting,
+                      body_framing = {content_length, 0}, buffer = B}) ->
+    {done, B};
+parse_body(#h1_parser{body_state = waiting,
+                      body_framing = {content_length, N}} = St)
+    when is_integer(N), N > 0 ->
+    parse_body(St#h1_parser{body_state =
+        {stream, fun te_identity/2, {0, N}, fun ce_identity/1}});
+parse_body(#h1_parser{body_state = waiting,
+                      body_framing = close_delimited} = St) ->
+    parse_body(St#h1_parser{body_state =
+        {stream, fun te_close/2, undefined, fun ce_identity/1}});
 parse_body(#h1_parser{body_state = done, buffer = B}) ->
     {done, B};
 parse_body(#h1_parser{buffer = B, body_state = {stream, _, _, _}} = St)
@@ -491,21 +578,43 @@ parse_body(#h1_parser{buffer = B, body_state = {stream, _, _, _}} = St)
 parse_body(#h1_parser{} = St) ->
     {more, St, <<>>}.
 
-has_chunked_safe(undefined) -> false;
-has_chunked_safe(TE) -> has_chunked(TE).
+%% Finalize a close-delimited body when the socket has been closed. The
+%% parser cannot tell whether a close-delimited response is complete by
+%% looking at bytes alone — the connection driver must call this on
+%% `tcp_closed' / `ssl_closed'.
+-spec finish(parser()) -> {done, binary()} | {error, term()}.
+finish(#h1_parser{body_framing = close_delimited, buffer = B}) ->
+    {done, B};
+finish(#h1_parser{body_framing = no_body, buffer = B}) ->
+    {done, B};
+finish(#h1_parser{body_state = done, buffer = B}) ->
+    {done, B};
+finish(#h1_parser{}) ->
+    {error, incomplete}.
 
 transfer_decode(Data, #h1_parser{
     body_state = {stream, TD, TS, CD}, buffer = Buf} = St) ->
     case TD(Data, TS) of
         {ok, Data2, TS2} ->
-            content_decode(CD, Data2,
-                St#h1_parser{body_state = {stream, TD, TS2, CD}});
+            case enforce_body_size(Data2, St) of
+                {ok, St1} ->
+                    content_decode(CD, Data2,
+                        St1#h1_parser{body_state = {stream, TD, TS2, CD}});
+                {error, R} -> {error, R}
+            end;
         {ok, Data2, Rest, TS2} ->
-            content_decode(CD, Data2,
-                St#h1_parser{buffer = Rest,
-                             body_state = {stream, TD, TS2, CD}});
+            case enforce_body_size(Data2, St) of
+                {ok, St1} ->
+                    content_decode(CD, Data2,
+                        St1#h1_parser{buffer = Rest,
+                                      body_state = {stream, TD, TS2, CD}});
+                {error, R} -> {error, R}
+            end;
         {chunk_ok, Chunk, Rest} ->
-            {ok, Chunk, St#h1_parser{buffer = Rest}};
+            case enforce_body_size(Chunk, St) of
+                {ok, St1} -> {ok, Chunk, St1#h1_parser{buffer = Rest}};
+                {error, R} -> {error, R}
+            end;
         {chunk_done, Rest} ->
             parse_trailer_step(St#h1_parser{buffer = Rest,
                                             state = on_trailers,
@@ -519,15 +628,31 @@ transfer_decode(Data, #h1_parser{
         {done, Rest} ->
             {done, Rest};
         {done, Data2, Rest} ->
-            content_decode(CD, Data2,
-                St#h1_parser{buffer = Rest, body_state = done});
+            case enforce_body_size(Data2, St) of
+                {ok, St1} ->
+                    content_decode(CD, Data2,
+                        St1#h1_parser{buffer = Rest, body_state = done});
+                {error, R} -> {error, R}
+            end;
         {done, Data2, _Total, Rest} ->
-            content_decode(CD, Data2,
-                St#h1_parser{buffer = Rest, body_state = done});
+            case enforce_body_size(Data2, St) of
+                {ok, St1} ->
+                    content_decode(CD, Data2,
+                        St1#h1_parser{buffer = Rest, body_state = done});
+                {error, R} -> {error, R}
+            end;
         done ->
             {done, <<>>};
         {error, R} ->
             {error, R}
+    end.
+
+enforce_body_size(_Data, #h1_parser{max_body_size = infinity} = St) ->
+    {ok, St};
+enforce_body_size(Data, #h1_parser{body_read = R, max_body_size = Max} = St) ->
+    case R + byte_size(Data) of
+        N when N > Max -> {error, body_too_large};
+        N              -> {ok, St#h1_parser{body_read = N}}
     end.
 
 content_decode(CD, Data, St) ->
@@ -547,6 +672,11 @@ te_identity(Data, {Streamed, Total}) ->
     Size = Total - Streamed,
     <<Data2:Size/binary, Rest/binary>> = Data,
     {done, Data2, Total, Rest}.
+
+%% --- close-delimited body decoder ------------------------------------------
+%% Emits every byte as a data chunk. The connection driver must call
+%% `h1_parse_erl:finish/1' on socket close to produce the final `done'.
+te_close(Data, _State) -> {ok, Data, undefined}.
 
 %% --- chunked body decoder ---------------------------------------------------
 
@@ -576,6 +706,14 @@ read_size(<<$;, Rest/binary>>, Size, Len) when Len > 0 ->
     skip_ext(Rest, Size);
 read_size(<<$\s, Rest/binary>>, Size, Len) when Len > 0 ->
     skip_ext(Rest, Size);
+%% DoS guard: a chunk-size line with more than 16 hex digits describes a
+%% body larger than any 64-bit size and is almost certainly hostile.
+read_size(<<C, _/binary>>, _, Len)
+    when Len >= ?H1_MAX_CHUNK_SIZE_HEX,
+         ((C >= $0 andalso C =< $9)
+          orelse (C >= $a andalso C =< $f)
+          orelse (C >= $A andalso C =< $F)) ->
+    {error, chunk_size_too_long};
 read_size(<<C, Rest/binary>>, Size, Len) when C >= $0, C =< $9 ->
     read_size(Rest, (Size bsl 4) bor (C - $0), Len + 1);
 read_size(<<C, Rest/binary>>, Size, Len) when C >= $a, C =< $f ->
@@ -622,11 +760,35 @@ parse_trailer_step(#h1_parser{buffer = B} = St) ->
                 {headers_complete, St1} ->
                     {done, St1#h1_parser.buffer};
                 {header, {K, V}, St1} ->
-                    {trailer, {K, V}, St1};
+                    %% RFC 9110 §6.5.1: a handful of fields MUST NOT
+                    %% appear in trailers. K is already lowercased.
+                    case forbidden_trailer(K) of
+                        true  -> {error, forbidden_trailer};
+                        false -> {trailer, {K, V}, St1}
+                    end;
                 Other ->
                     Other
             end
     end.
+
+forbidden_trailer(<<"content-length">>)       -> true;
+forbidden_trailer(<<"transfer-encoding">>)    -> true;
+forbidden_trailer(<<"trailer">>)              -> true;
+forbidden_trailer(<<"content-type">>)         -> true;
+forbidden_trailer(<<"content-encoding">>)     -> true;
+forbidden_trailer(<<"content-range">>)        -> true;
+forbidden_trailer(<<"host">>)                 -> true;
+forbidden_trailer(<<"expect">>)               -> true;
+forbidden_trailer(<<"max-forwards">>)         -> true;
+forbidden_trailer(<<"cache-control">>)        -> true;
+forbidden_trailer(<<"te">>)                   -> true;
+forbidden_trailer(<<"connection">>)           -> true;
+forbidden_trailer(<<"authorization">>)        -> true;
+forbidden_trailer(<<"proxy-authenticate">>)   -> true;
+forbidden_trailer(<<"proxy-authorization">>)  -> true;
+forbidden_trailer(<<"set-cookie">>)           -> true;
+forbidden_trailer(<<"cookie">>)               -> true;
+forbidden_trailer(_)                          -> false.
 
 match_crlf_prefix(<<"\r\n", _/binary>>) -> crlf;
 match_crlf_prefix(<<"\n", _/binary>>) -> lf;

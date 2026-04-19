@@ -18,6 +18,10 @@
     choose_framing_chunked/1,
     choose_framing_no_body/1,
     reject_header_injection/1,
+    encode_rejects_header_name_with_crlf/1,
+    encode_rejects_method_with_crlf/1,
+    encode_rejects_path_with_crlf/1,
+    encode_rejects_reason_with_control_chars/1,
     status_text_coverage/1
 ]).
 
@@ -26,7 +30,12 @@ all() ->
      encode_request_roundtrip, encode_response_roundtrip,
      encode_chunked_roundtrip, encode_trailers_roundtrip,
      choose_framing_known_body, choose_framing_chunked, choose_framing_no_body,
-     reject_header_injection, status_text_coverage].
+     reject_header_injection,
+     encode_rejects_header_name_with_crlf,
+     encode_rejects_method_with_crlf,
+     encode_rejects_path_with_crlf,
+     encode_rejects_reason_with_control_chars,
+     status_text_coverage].
 
 encode_request_line(_Config) ->
     ?assertEqual(<<"GET / HTTP/1.1\r\n">>,
@@ -117,6 +126,22 @@ reject_header_injection(_Config) ->
     %% Bare CR or LF in a header value must not be silently included.
     Evil = [{<<"x-evil">>, <<"a\r\nX-Injected: yes">>}],
     ?assertError({invalid_header_value, _}, h1_message:headers(Evil)).
+
+encode_rejects_header_name_with_crlf(_Config) ->
+    Evil = [{<<"X-Evil\r\nX-Injected">>, <<"v">>}],
+    ?assertError({invalid_header_name, _}, h1_message:headers(Evil)).
+
+encode_rejects_method_with_crlf(_Config) ->
+    ?assertError({invalid_method, _},
+                 h1_message:request_line(<<"GET\r\n">>, <<"/">>, ?HTTP_1_1)).
+
+encode_rejects_path_with_crlf(_Config) ->
+    ?assertError({invalid_path, _},
+                 h1_message:request_line(<<"GET">>, <<"/\r\ninjected">>, ?HTTP_1_1)).
+
+encode_rejects_reason_with_control_chars(_Config) ->
+    ?assertError({invalid_reason_phrase, _},
+                 h1_message:status_line(500, <<"Oops\x01Bad">>, ?HTTP_1_1)).
 
 status_text_coverage(_Config) ->
     %% Sample a handful including the 101 entry used by Upgrade.
