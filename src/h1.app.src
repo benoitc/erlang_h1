@@ -12,6 +12,10 @@
    ]},
   {env, []},
   {modules, []},
+  %% The short `h1' name is already taken on hex.pm, so the package is
+  %% published as `erlang_h1'. The OTP application and module atom
+  %% stay `h1' — call sites keep writing `h1:connect/2'.
+  {pkg_name, "erlang_h1"},
   {licenses, ["Apache-2.0"]},
   {links, [{"GitHub", "https://github.com/benoitc/erlang_h1"}]}
  ]}.
