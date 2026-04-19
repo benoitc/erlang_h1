@@ -5,6 +5,7 @@ HTTP/1.1 client and server for Erlang/OTP. Designed so call sites that already u
 - **RFC 9110 / RFC 9112** messages — chunked transfer, trailers, `Expect: 100-continue`, obs-fold tolerated.
 - **RFC 9112 §9.3** request pipelining with in-order response delivery on the wire.
 - **RFC 9112 §7** `Upgrade` / **101 Switching Protocols** primitive, including socket handoff.
+- **RFC 9110 §9.3.6** `CONNECT` tunnel primitive (`h1:accept_connect/3,4`): 200 Connection Established with atomic raw-socket handoff, no chunked framing.
 - **RFC 9297** capsule codec for post-Upgrade framing (wire-compatible with `h2`, shared by [`masque`](https://github.com/benoitc/erlang_masque) for RFC 9298 CONNECT-UDP).
 - Hardened against request smuggling (RFC 9112 §6.1), slowloris (idle + request timers), and oversized framing.
 - TLS defaults to `verify_peer` with the OS trust store and hostname verification.
@@ -33,11 +34,11 @@ was already taken on hex.pm). The OTP application and module atom stay
 
 ```erlang
 %% rebar.config — from hex
-{deps, [{erlang_h1, "0.1.1"}]}.
+{deps, [{erlang_h1, "0.2.0"}]}.
 
 %% Or directly from git
 {deps, [
-    {erlang_h1, {git, "https://github.com/benoitc/erlang_h1.git", {tag, "0.1.1"}}}
+    {erlang_h1, {git, "https://github.com/benoitc/erlang_h1.git", {tag, "0.2.0"}}}
 ]}.
 ```
 
@@ -577,8 +578,8 @@ For a production-shaped protocol module (per-request handler supervision, pipeli
 ```bash
 rebar3 compile
 rebar3 eunit          # 52 tests + 4 PropEr roundtrip properties
-rebar3 ct             # 143 CT cases across parse / message / capsule / connection
-                      # / e2e / upgrade / interop / compliance
+rebar3 ct             # 157 CT cases across parse / message / capsule / connection
+                      # / e2e / upgrade / connect / interop / compliance
 rebar3 dialyzer       # clean
 rebar3 ex_doc         # HTML docs under doc/
 ```
@@ -605,7 +606,7 @@ Useful for embedding HTTP/1.1 into Erlang applications that also want the h2 / h
 
 - HTTP/0.9.
 - `Upgrade: h2c` cleartext negotiation (deprecated by RFC 9113); use ALPN with `h2` directly instead.
-- Proxy-specific semantics (forward proxy, CONNECT to arbitrary hosts) — the `Upgrade` primitive is enough for `masque` and the WebSocket / `h2c`-over-Upgrade dance is explicitly not supported.
+- Proxy-specific semantics beyond the `Upgrade` and `CONNECT 200` primitives (upstream routing, forward-proxy ACLs, `Proxy-Authorization`). `accept_upgrade` and `accept_connect` hand the socket off; the rest belongs in the proxy library. WebSocket / `h2c`-over-Upgrade framing is explicitly out of scope.
 
 See `docs/features.md` for the full RFC coverage + gap list.
 
