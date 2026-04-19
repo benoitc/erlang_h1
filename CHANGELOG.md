@@ -4,6 +4,14 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] - 2026-04-19
+
+### Fixed
+
+- `h1:upgrade/4` crash when the `:path` pseudo-header is supplied (dead-code
+  path in `handle_client_upgrade/4` eagerly encoded pseudo-headers before
+  `upgrade_wire/1` stripped them).
+
 ## [0.2.0] - 2026-04-19
 
 ### Added
@@ -106,3 +114,4 @@ Initial release.
 [0.1.0]: https://github.com/benoitc/erlang_h1/releases/tag/0.1.0
 [0.1.1]: https://github.com/benoitc/erlang_h1/releases/tag/0.1.1
 [0.2.0]: https://github.com/benoitc/erlang_h1/releases/tag/0.2.0
+[0.2.1]: https://github.com/benoitc/erlang_h1/releases/tag/0.2.1

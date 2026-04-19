@@ -11,11 +11,14 @@
 -export([
     upgrade_handshake/1,
     upgrade_capsule_exchange/1,
-    upgrade_with_leftover_bytes/1
+    upgrade_with_leftover_bytes/1,
+    upgrade_with_path_pseudo_header/1,
+    upgrade_wire_path_in_request_line/1
 ]).
 
 all() ->
-    [upgrade_handshake, upgrade_capsule_exchange, upgrade_with_leftover_bytes].
+    [upgrade_handshake, upgrade_capsule_exchange, upgrade_with_leftover_bytes,
+     upgrade_with_path_pseudo_header, upgrade_wire_path_in_request_line].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(h1),
@@ -130,6 +133,74 @@ upgrade_with_leftover_bytes(Config0) ->
     receive {server_done, _SSock} -> ok after 2000 -> ct:fail(no_server_done) end,
     gen_tcp:close(Sock),
     ok.
+
+%% Regression: h1:upgrade/4 crashed with {invalid_header_name, <<":path">>}
+%% when a caller passed the documented `:path' pseudo-header. The eager
+%% dead-code Wire block in handle_client_upgrade/4 encoded the full header
+%% list before upgrade_wire/1 stripped the pseudo-header.
+upgrade_with_path_pseudo_header(Config0) ->
+    Handler = fun(Conn, StreamId, _M, _P, _Hs) ->
+        {ok, _Sock, _Buf} = h1:accept_upgrade(Conn, StreamId, []),
+        ok
+    end,
+    Config = start_server(Handler, Config0),
+    Port = h1:server_port(?config(server_ref, Config)),
+    {ok, Conn} = h1:connect("127.0.0.1", Port, #{transport => tcp}),
+    Result = h1:upgrade(Conn, <<"demo">>,
+                        [{<<":path">>, <<"/some/deep/path">>},
+                         {<<"host">>, <<"localhost">>}], 5000),
+    ?assertMatch({ok, _Id, _Sock, _Buf, _RespHs}, Result),
+    {ok, _Id, Sock, _Buf, RespHs} = Result,
+    ?assertEqual(<<"demo">>,
+                 proplists:get_value(<<"upgrade">>, RespHs)),
+    gen_tcp:close(Sock),
+    ok.
+
+%% Wire-shape regression: :path must land in the request-line, not as a
+%% header. Uses a raw TCP listener (no h1 server) to capture the exact
+%% bytes the client writes.
+upgrade_wire_path_in_request_line(_Config) ->
+    {ok, L} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true},
+                                 {ip, {127,0,0,1}}, {packet, raw}]),
+    {ok, Port} = inet:port(L),
+    Parent = self(),
+    spawn_link(fun() ->
+        {ok, Sock} = gen_tcp:accept(L, 5000),
+        gen_tcp:close(L),
+        Bytes = recv_until_headers(Sock),
+        Parent ! {raw_request, Bytes},
+        %% Reply with a well-formed 101 so the client does not hang.
+        Resp = <<"HTTP/1.1 101 Switching Protocols\r\n"
+                 "Connection: Upgrade\r\n"
+                 "Upgrade: demo\r\n\r\n">>,
+        gen_tcp:send(Sock, Resp),
+        receive stop -> gen_tcp:close(Sock) after 5000 -> ok end
+    end),
+    {ok, Conn} = h1:connect("127.0.0.1", Port, #{transport => tcp}),
+    _ = h1:upgrade(Conn, <<"demo">>,
+                   [{<<":path">>, <<"/some/deep/path">>},
+                    {<<"host">>, <<"localhost">>}], 5000),
+    Bytes = receive {raw_request, B} -> B after 5000 -> ct:fail(no_bytes) end,
+    [Line1 | _] = binary:split(Bytes, <<"\r\n">>),
+    ?assertEqual(<<"GET /some/deep/path HTTP/1.1">>, Line1),
+    Lower = string:lowercase(Bytes),
+    ?assert(binary:match(Lower, <<"upgrade: demo">>) =/= nomatch),
+    ?assert(binary:match(Lower, <<"connection: upgrade">>) =/= nomatch),
+    %% :path must NOT appear as a header line.
+    ?assertEqual(nomatch, binary:match(Bytes, <<":path">>)),
+    ok.
+
+recv_until_headers(Sock) ->
+    recv_until_headers(Sock, <<>>).
+recv_until_headers(Sock, Acc) ->
+    case binary:match(Acc, <<"\r\n\r\n">>) of
+        nomatch ->
+            case gen_tcp:recv(Sock, 0, 5000) of
+                {ok, Bin} -> recv_until_headers(Sock, <<Acc/binary, Bin/binary>>);
+                {error, R} -> ct:fail({recv_until_headers, R})
+            end;
+        _ -> Acc
+    end.
 
 %% ----------------------------------------------------------------------------
 %% Helpers

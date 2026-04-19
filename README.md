@@ -34,11 +34,11 @@ was already taken on hex.pm). The OTP application and module atom stay
 
 ```erlang
 %% rebar.config — from hex
-{deps, [{erlang_h1, "0.2.0"}]}.
+{deps, [{erlang_h1, "0.2.1"}]}.
 
 %% Or directly from git
 {deps, [
-    {erlang_h1, {git, "https://github.com/benoitc/erlang_h1.git", {tag, "0.2.0"}}}
+    {erlang_h1, {git, "https://github.com/benoitc/erlang_h1.git", {tag, "0.2.1"}}}
 ]}.
 ```
 
@@ -578,7 +578,7 @@ For a production-shaped protocol module (per-request handler supervision, pipeli
 ```bash
 rebar3 compile
 rebar3 eunit          # 52 tests + 4 PropEr roundtrip properties
-rebar3 ct             # 157 CT cases across parse / message / capsule / connection
+rebar3 ct             # 159 CT cases across parse / message / capsule / connection
                       # / e2e / upgrade / connect / interop / compliance
 rebar3 dialyzer       # clean
 rebar3 ex_doc         # HTML docs under doc/

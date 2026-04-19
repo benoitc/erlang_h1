@@ -1181,13 +1181,10 @@ handle_client_upgrade(From, Protocol, Headers, State) ->
     Hs0 = upsert(<<"connection">>, <<"Upgrade">>, Headers),
     Hs1 = upsert(<<"upgrade">>, Protocol, Hs0),
     Id = State#state.next_stream_id,
-    Wire = [h1_message:request_line(<<"GET">>,
-                                    maps:get(path, #{}, <<"/">>), ?HTTP_1_1),
-            h1_message:headers(Hs1),
-            <<"\r\n">>],
-    _ = Wire,
-    %% The caller really wants the path in Headers; we don't try to guess.
-    %% We implement upgrade by reusing send_request with method=GET.
+    %% `upgrade_wire/1' strips the `:path' pseudo-header into the
+    %% request-line before encoding the rest of the headers with
+    %% `h1_message:headers/1', which rejects pseudo-headers. Do NOT
+    %% encode `Hs1' directly here.
     case sock_send(State, upgrade_wire(Hs1)) of
         ok ->
             Stream = #stream{id = Id, state = open, method = <<"GET">>,
