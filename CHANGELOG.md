@@ -4,6 +4,17 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-04-19
+
+### Added
+
+- `h1:accept_connect/3,4`: server-side reply of `200 Connection
+  Established` to a classic HTTP/1.1 CONNECT with atomic raw-socket
+  handoff (RFC 9110 §9.3.6, RFC 9112 §3.2.3). Mirrors
+  `h1:accept_upgrade/3` but writes status 200 and injects no
+  Connection/Upgrade/framing headers, so bytes past the terminating
+  CRLF belong to the tunnel.
+
 ## [0.1.1] — 2026-04-19
 
 ### Changed

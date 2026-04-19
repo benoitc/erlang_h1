@@ -48,6 +48,7 @@
 %% HTTP/1.1-specific
 -export([upgrade/3, upgrade/4]).
 -export([accept_upgrade/3]).
+-export([accept_connect/3, accept_connect/4]).
 -export([continue/2]).
 -export([pipeline/2]).
 
@@ -342,6 +343,21 @@ upgrade(Conn, Protocol, Headers, Timeout) ->
     {ok, term(), binary()} | {error, term()}.
 accept_upgrade(Conn, StreamId, ExtraHeaders) ->
     h1_connection:accept_upgrade(Conn, StreamId, ExtraHeaders).
+
+%% @doc Server: reply 200 Connection Established to a classic HTTP/1.1
+%% CONNECT (RFC 9110 §9.3.6, RFC 9112 §3.2.3 authority-form request-target)
+%% and take ownership of the raw socket. Mirror of `accept_upgrade/3' for
+%% the 101 Switching Protocols case, but writes status 200 and injects no
+%% Connection/Upgrade headers so bytes after CRLF belong to the tunnel.
+-spec accept_connect(connection(), stream_id(), headers()) ->
+    {ok, gen_tcp | ssl, term(), binary()} | {error, term()}.
+accept_connect(Conn, StreamId, ExtraHeaders) ->
+    h1_connection:accept_connect(Conn, StreamId, ExtraHeaders).
+
+-spec accept_connect(connection(), stream_id(), headers(), timeout()) ->
+    {ok, gen_tcp | ssl, term(), binary()} | {error, term()}.
+accept_connect(Conn, StreamId, ExtraHeaders, Timeout) ->
+    h1_connection:accept_connect(Conn, StreamId, ExtraHeaders, Timeout).
 
 %% @doc Server: send 100 Continue to a client waiting on Expect.
 -spec continue(connection(), stream_id()) -> ok | {error, term()}.

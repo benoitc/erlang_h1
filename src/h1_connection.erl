@@ -33,6 +33,7 @@
 -export([continue/2]).
 -export([upgrade/3, upgrade/4]).
 -export([accept_upgrade/3]).
+-export([accept_connect/3, accept_connect/4]).
 -export([cancel_stream/2, cancel_stream/3]).
 -export([send_goaway/1, send_goaway/2]).
 -export([set_stream_handler/3, set_stream_handler/4, unset_stream_handler/2]).
@@ -189,6 +190,16 @@ upgrade(Pid, Protocol, Headers, Timeout) ->
 %% 101 response; `Connection: upgrade' + `Upgrade: <token>' are auto-added.
 accept_upgrade(Pid, StreamId, ExtraHeaders) ->
     gen_statem:call(Pid, {accept_upgrade, StreamId, ExtraHeaders}).
+
+%% @doc Server: reply 200 Connection Established to a classic HTTP/1.1
+%% CONNECT and take ownership of the raw socket in one step. `ExtraHeaders'
+%% are written as-is; no Connection/Upgrade/framing headers are injected,
+%% so bytes after the terminating CRLF belong to the tunnel.
+accept_connect(Pid, StreamId, ExtraHeaders) ->
+    gen_statem:call(Pid, {accept_connect, StreamId, ExtraHeaders}).
+
+accept_connect(Pid, StreamId, ExtraHeaders, Timeout) ->
+    gen_statem:call(Pid, {accept_connect, StreamId, ExtraHeaders}, Timeout).
 
 %% @doc Abort a stream. Because H1 has no RST_STREAM equivalent, this
 %% advertises `Connection: close' and closes the socket once the current
@@ -376,6 +387,9 @@ handle_event({call, From}, {upgrade, Protocol, Headers}, open,
 handle_event({call, From}, {accept_upgrade, StreamId, ExtraHeaders}, open,
              #state{mode = server} = State) ->
     handle_accept_upgrade(From, StreamId, ExtraHeaders, State);
+handle_event({call, From}, {accept_connect, StreamId, ExtraHeaders}, open,
+             #state{mode = server} = State) ->
+    handle_accept_connect(From, StreamId, ExtraHeaders, State);
 
 %% --- handler registration ---------------------------------------------------
 
@@ -1260,6 +1274,42 @@ handle_accept_upgrade(From, StreamId, ExtraHeaders, State) ->
                             {keep_state_and_data,
                              [{reply, From, {error, R}}]}
                     end
+            end;
+        error ->
+            {keep_state_and_data, [{reply, From, {error, unknown_stream}}]}
+    end.
+
+handle_accept_connect(From, StreamId, ExtraHeaders, State) ->
+    case maps:find(StreamId, State#state.streams) of
+        {ok, #stream{status = Status}} when Status =/= undefined ->
+            {keep_state_and_data,
+             [{reply, From, {error, response_already_sent}}]};
+        {ok, _Stream} ->
+            Wire = [h1_message:status_line(200,
+                                           <<"Connection Established">>,
+                                           ?HTTP_1_1),
+                    h1_message:headers(ExtraHeaders),
+                    <<"\r\n">>],
+            case sock_send(State, Wire) of
+                ok ->
+                    Buffer = h1_parse_erl:get(State#state.parser, buffer),
+                    State1 = set_active_false(State),
+                    {FromPid, _} = From,
+                    Transport = State1#state.transport,
+                    Socket = State1#state.socket,
+                    _ = case Transport of
+                        gen_tcp -> gen_tcp:controlling_process(Socket, FromPid);
+                        ssl     -> ssl:controlling_process(Socket, FromPid)
+                    end,
+                    gen_statem:reply(From,
+                                     {ok, Transport, Socket, Buffer}),
+                    notify(State1#state.owner,
+                           {connected, StreamId, Transport, Socket, Buffer},
+                           self()),
+                    {stop, {shutdown, connected},
+                     State1#state{socket_handed_off = true}};
+                {error, R} ->
+                    {keep_state_and_data, [{reply, From, {error, R}}]}
             end;
         error ->
             {keep_state_and_data, [{reply, From, {error, unknown_stream}}]}
