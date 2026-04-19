@@ -27,10 +27,17 @@ HTTP/1.1 client and server for Erlang/OTP. Designed so call sites that already u
 
 ## Install
 
+The hex package is published as **`erlang_h1`** (the short name `h1`
+was already taken on hex.pm). The OTP application and module atom stay
+`h1`, so call sites write `h1:connect/2` either way.
+
 ```erlang
-%% rebar.config
+%% rebar.config — from hex
+{deps, [{erlang_h1, "0.1.1"}]}.
+
+%% Or directly from git
 {deps, [
-    {h1, "0.1.0", {git, "https://github.com/benoitc/erlang_h1.git", {tag, "0.1.0"}}}
+    {erlang_h1, {git, "https://github.com/benoitc/erlang_h1.git", {tag, "0.1.1"}}}
 ]}.
 ```
 

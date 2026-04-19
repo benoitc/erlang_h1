@@ -4,6 +4,14 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] — 2026-04-19
+
+### Changed
+
+- Hex package name is **`erlang_h1`** (the short `h1` is already taken
+  on hex.pm). The OTP application, module atom, and public API are
+  unchanged — call sites continue to use `h1:connect/2` etc.
+
 ## [0.1.0] — 2026-04-19
 
 Initial release.
@@ -85,3 +93,4 @@ Initial release.
   graceful drain, gotchas.
 
 [0.1.0]: https://github.com/benoitc/erlang_h1/releases/tag/0.1.0
+[0.1.1]: https://github.com/benoitc/erlang_h1/releases/tag/0.1.1

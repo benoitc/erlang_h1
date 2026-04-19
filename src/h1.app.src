@@ -1,6 +1,6 @@
 {application, h1,
  [{description, "HTTP/1.1 protocol library for Erlang"},
-  {vsn, "0.1.0"},
+  {vsn, "0.1.1"},
   {registered, [h1_sup]},
   {mod, {h1_app, []}},
   {applications,
