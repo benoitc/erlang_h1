@@ -44,6 +44,15 @@
 - On either side, after a successful 101 the `gen_statem` stops with `{shutdown, upgraded}` and the socket is `controlling_process`'d to the caller, along with any leftover buffered bytes.
 - `h1_upgrade` provides framing-agnostic capsule send / recv helpers on the handed-back socket for consumers (e.g. `masque` for RFC 9298 CONNECT-UDP).
 
+### CONNECT tunnels (RFC 9110 §9.3.6, RFC 9112 §3.2.3)
+
+- Classic HTTP/1.1 `CONNECT authority HTTP/1.1` requests reach the server as a regular `{request, StreamId, <<"CONNECT">>, Authority, Headers}` event. The request target is in authority-form (`host:port` or `[ipv6]:port`) and is surfaced verbatim in `Path`.
+- Server handler replies with `h1:accept_connect/3,4`. The helper writes `HTTP/1.1 200 Connection Established\r\n` plus caller-supplied headers plus the terminating CRLF directly, then atomically hands the raw socket off to the caller. Return shape: `{ok, Transport, Socket, Buffer}` where `Transport` is `gen_tcp` or `ssl` and `Buffer` is any bytes the parser had already read past the request.
+- No `Connection: Upgrade` / `Upgrade:` / `Transfer-Encoding: chunked` headers are injected: bytes past the blank line belong to the tunnel, not to an HTTP response body. Sequencing `send_response/4` + a separate handoff would be wrong because `send_response/4` defaults to chunked framing when no `Content-Length` is set.
+- After a successful `accept_connect`, the `gen_statem` stops with `{shutdown, connected}` and leaves the socket open (owned by the caller). The owner also receives `{h1, Conn, {connected, StreamId, Transport, Socket, Buffer}}`.
+- Error returns: `{error, unknown_stream}` (bogus StreamId), `{error, response_already_sent}` (after `h1:send_response/4` on the same stream), `{error, Reason}` from the underlying `send`.
+- Counterpart to `accept_upgrade/3` for the 101 Switching Protocols case. Downstream use: `erlang_masque`'s HTTP/1.1 CONNECT-TCP fallback.
+
 ### Capsules (RFC 9297)
 
 - `h1_capsule:encode/2` and `h1_capsule:decode/1` implement the `Capsule-Protocol` wire format (varint type + varint length + payload).
@@ -79,6 +88,7 @@ h1:send_response/4
 %% HTTP/1.1-specific
 h1:upgrade/3,4
 h1:accept_upgrade/3
+h1:accept_connect/3,4
 h1:continue/2
 h1:pipeline/2
 
@@ -100,6 +110,7 @@ The export list mirrors `h2` and `quic_h3` where semantics overlap. H1-specific 
 {h1, Conn, {trailers,      StreamId, Headers}}
 {h1, Conn, {upgrade,       StreamId, Proto, Method, Path, Headers}} %% server: peer asked for Upgrade
 {h1, Conn, {upgraded,      StreamId, Proto, Socket, Buffer, Headers}} %% after 101
+{h1, Conn, {connected,     StreamId, Transport, Socket, Buffer}}     %% after CONNECT 200
 {h1, Conn, {stream_reset,  StreamId, Reason}}
 {h1, Conn, {goaway,        LastStreamId, Reason}}
 {h1, Conn, {closed,        Reason}}
@@ -120,7 +131,7 @@ Inside the server, `h1_server` re-routes `{h1, Conn, {data, …}}` / `{trailers,
 - **HTTP/0.9.** Not parsed, not generated.
 - **`Upgrade: h2c`** cleartext negotiation to HTTP/2 — deprecated by RFC 9113. Use ALPN with `h2` (or `h2c` via prior knowledge) in the `h2` library instead.
 - **Server push**, ETag / caching policy, content coding (`gzip`, `br`, …). The library ships the messages as-is; compression is a caller concern.
-- **Proxy-specific semantics** beyond the `Upgrade` primitive (forward proxy, CONNECT to arbitrary hosts). The `Upgrade` machinery is enough for `masque` and equivalent tunnelling libraries; richer proxy features belong in a dedicated module.
+- **Proxy-specific semantics** beyond the `Upgrade` and `CONNECT 200` primitives (routing to upstream hosts, forward-proxy ACLs, `Proxy-Authorization` handling). The `accept_upgrade` and `accept_connect` helpers give downstream libraries (`masque`, custom forward proxies) the socket after a successful handshake; everything beyond that belongs in the proxy library.
 - **WebSocket framing** on top of an Upgraded connection — `Upgrade: websocket` is parsed and the handshake is exposed, but the `ws` frame layer is out of scope here. Layer it on top of the handed-back socket with a dedicated library.
 
 ## Internal modules
@@ -149,5 +160,6 @@ Inside the server, `h1_server` re-routes `{h1, Conn, {data, …}}` / `{trailers,
 - `rebar3 ct --suite=test/h1_connection_SUITE` — 13 loopback `gen_statem` cases: GET / POST / chunked / trailers / keep-alive / pipelining / Expect / Upgrade / capsule exchange.
 - `rebar3 ct --suite=test/h1_e2e_SUITE` — 8 cases through the public API over real TCP + TLS.
 - `rebar3 ct --suite=test/h1_upgrade_SUITE` — 3 end-to-end upgrade cases with capsule framing.
+- `rebar3 ct --suite=test/h1_connect_SUITE` — 8 end-to-end CONNECT cases (authority-form targets, IPv6, ExtraHeaders round-trip, no-chunked-framing probe, socket ownership after handoff, `{shutdown, connected}` termination, error paths).
 - `rebar3 ct --suite=test/h1_interop_SUITE` — curl / python3 / nginx probes, skipped when the binary is absent.
 - `rebar3 dialyzer` — clean.
