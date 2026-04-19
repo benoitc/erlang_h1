@@ -33,14 +33,10 @@ end_per_suite(_Config) ->
 
 init_per_testcase(TC, Config) ->
     process_flag(trap_exit, true),
-    case required_binary(TC) of
-        undefined ->
-            Config;
-        Bin ->
-            case os:find_executable(Bin) of
-                false -> {skip, {missing, Bin}};
-                _ -> Config
-            end
+    case required_tool(TC) of
+        none   -> Config;
+        curl   -> probe("curl", Config);
+        docker -> probe_docker(Config)
     end.
 
 end_per_testcase(_TC, Config) ->
@@ -48,19 +44,41 @@ end_per_testcase(_TC, Config) ->
         undefined -> ok;
         Ref -> catch h1:stop_server(Ref)
     end,
-    case ?config(external_port, Config) of
+    case ?config(docker_container, Config) of
         undefined -> ok;
-        ExtPort -> catch erlang:port_close(ExtPort)
+        Cid -> _ = os:cmd("docker stop " ++ Cid ++ " >/dev/null 2>&1"), ok
     end,
     ok.
 
-required_binary(curl_get)              -> "curl";
-required_binary(curl_post)             -> "curl";
-required_binary(curl_head)             -> "curl";
-required_binary(curl_chunked)          -> "curl";
-required_binary(our_client_to_python)  -> "python3";
-required_binary(our_client_to_nginx)   -> "nginx";
-required_binary(_)                     -> undefined.
+%% `curl` runs locally because it's just a client we drive against our
+%% server. Anything that needs to *be* the peer (nginx, python
+%% http.server) is launched in a short-lived Docker container so the
+%% host stays clean and the test environment matches what runs in CI.
+required_tool(curl_get)              -> curl;
+required_tool(curl_post)             -> curl;
+required_tool(curl_head)             -> curl;
+required_tool(curl_chunked)          -> curl;
+required_tool(our_client_to_python)  -> docker;
+required_tool(our_client_to_nginx)   -> docker;
+required_tool(_)                     -> none.
+
+probe(Bin, Config) ->
+    case os:find_executable(Bin) of
+        false -> {skip, {missing, Bin}};
+        _     -> Config
+    end.
+
+probe_docker(Config) ->
+    case os:find_executable("docker") of
+        false -> {skip, {missing, "docker"}};
+        _ ->
+            %% Confirm the daemon is reachable, not just the CLI.
+            case os:cmd("docker info --format '{{.ServerVersion}}' 2>/dev/null") of
+                "" ++ _ = S when S =:= ""; S =:= "\n" ->
+                    {skip, {docker, daemon_unreachable}};
+                _  -> Config
+            end
+    end.
 
 %% ----------------------------------------------------------------------------
 %% Handlers
@@ -157,13 +175,14 @@ our_client_to_python(Config0) ->
     ok = filelib:ensure_dir(filename:join(Dir, ".")),
     ok = file:write_file(filename:join(Dir, "hello.txt"),
                          <<"from python">>),
-    Port = pick_free_port(),
-    PythonPort = erlang:open_port(
-        {spawn_executable, os:find_executable("python3")},
-        [{args, ["-m", "http.server", integer_to_list(Port), "--bind", "127.0.0.1"]},
-         {cd, Dir}, exit_status, stderr_to_stdout, binary]),
-    Config = [{external_port, PythonPort} | Config0],
-    ok = wait_ready("127.0.0.1", Port, 50),
+    {Cid, Port} = docker_run(
+        ["-v", Dir ++ ":/srv:ro", "-w", "/srv",
+         "-p", "127.0.0.1::8000",
+         "python:3-alpine",
+         "python3", "-m", "http.server", "8000", "--bind", "0.0.0.0"],
+        8000),
+    Config = [{docker_container, Cid} | Config0],
+    ok = wait_ready("127.0.0.1", Port, 100),
     {ok, Conn} = h1:connect("127.0.0.1", Port, #{transport => tcp}),
     {ok, Id} = h1:request(Conn, <<"GET">>, <<"/hello.txt">>,
                           [{<<"host">>, <<"127.0.0.1">>}]),
@@ -178,28 +197,25 @@ our_client_to_python(Config0) ->
 %% ----------------------------------------------------------------------------
 
 our_client_to_nginx(Config0) ->
-    Port = pick_free_port(),
-    {ConfDir, Prefix} = make_nginx_config(?config(priv_dir, Config0), Port),
-    Args = ["-p", Prefix, "-c", filename:join(ConfDir, "nginx.conf"),
-            "-g", "daemon off;"],
-    NginxPort = erlang:open_port(
-        {spawn_executable, os:find_executable("nginx")},
-        [{args, Args}, exit_status, stderr_to_stdout, binary]),
-    Config = [{external_port, NginxPort} | Config0],
-    case wait_ready("127.0.0.1", Port, 50) of
-        ok ->
-            {ok, Conn} = h1:connect("127.0.0.1", Port, #{transport => tcp}),
-            {ok, Id} = h1:request(Conn, <<"GET">>, <<"/">>,
-                                  [{<<"host">>, <<"127.0.0.1">>}]),
-            {Status, _Hs, Body} = collect_response(Conn, Id),
-            ?assertEqual(200, Status),
-            ?assertEqual(<<"hello from nginx\n">>, Body),
-            h1:close(Conn),
-            {save_config, Config};
-        {error, R} ->
-            ct:pal("nginx never came up: ~p", [R]),
-            {skip, {nginx_not_starting, R}}
-    end.
+    Html = filename:join(?config(priv_dir, Config0), "nginx-html"),
+    ok = filelib:ensure_dir(filename:join(Html, ".")),
+    ok = file:write_file(filename:join(Html, "index.html"),
+                         <<"hello from nginx\n">>),
+    {Cid, Port} = docker_run(
+        ["-v", Html ++ ":/usr/share/nginx/html:ro",
+         "-p", "127.0.0.1::80",
+         "nginx:alpine"],
+        80),
+    Config = [{docker_container, Cid} | Config0],
+    ok = wait_ready("127.0.0.1", Port, 100),
+    {ok, Conn} = h1:connect("127.0.0.1", Port, #{transport => tcp}),
+    {ok, Id} = h1:request(Conn, <<"GET">>, <<"/">>,
+                          [{<<"host">>, <<"127.0.0.1">>}]),
+    {Status, _Hs, Body} = collect_response(Conn, Id),
+    ?assertEqual(200, Status),
+    ?assertEqual(<<"hello from nginx\n">>, Body),
+    h1:close(Conn),
+    {save_config, Config}.
 
 %% ----------------------------------------------------------------------------
 %% Helpers
@@ -237,16 +253,63 @@ split_curl(Out) ->
     Code = binary:part(Out, Sz - 4, 3),
     {Body, Code}.
 
-pick_free_port() ->
-    {ok, L} = gen_tcp:listen(0, [{reuseaddr, true}]),
-    {ok, P} = inet:port(L),
-    ok = gen_tcp:close(L),
-    P.
+%% Start an auto-removing container, publishing the given container port
+%% to a random host port on 127.0.0.1. Returns the container id and the
+%% host-side port number. The caller is responsible for `docker stop'
+%% in `end_per_testcase'. `open_port' with `spawn_executable' skips the
+%% shell so argument quoting is a non-issue.
+docker_run(ExtraArgs, ContainerPort) ->
+    Args = ["run", "-d", "--rm"] ++ ExtraArgs,
+    {Out, 0} = run_docker(Args),
+    Cid = string:trim(Out),
+    case Cid of
+        [] -> ct:fail({docker_run_failed, Args, Out});
+        _  -> {Cid, docker_host_port(Cid, ContainerPort)}
+    end.
+
+docker_host_port(Cid, ContainerPort) ->
+    {Out, 0} = run_docker(["port", Cid,
+                           integer_to_list(ContainerPort) ++ "/tcp"]),
+    %% "docker port" prints "0.0.0.0:54321\n127.0.0.1:54321\n" or
+    %% similar — take the last colon-separated token of the first line.
+    Line = hd(string:split(string:trim(Out), "\n")),
+    [_, PortStr] = string:split(Line, ":", trailing),
+    list_to_integer(string:trim(PortStr)).
+
+run_docker(Args) ->
+    Exe = os:find_executable("docker"),
+    P = erlang:open_port({spawn_executable, Exe},
+                         [{args, Args}, exit_status, stderr_to_stdout,
+                          binary]),
+    collect_port_output(P, <<>>).
+
+collect_port_output(Port, Acc) ->
+    receive
+        {Port, {data, Bin}} ->
+            collect_port_output(Port, <<Acc/binary, Bin/binary>>);
+        {Port, {exit_status, Code}} ->
+            {binary_to_list(Acc), Code}
+    after 30000 ->
+        catch erlang:port_close(Port),
+        {binary_to_list(Acc), timeout}
+    end.
 
 wait_ready(_Host, _Port, 0) -> {error, not_ready};
 wait_ready(Host, Port, N) ->
-    case gen_tcp:connect(Host, Port, [{active, false}], 100) of
-        {ok, S} -> gen_tcp:close(S), ok;
+    %% Docker publishes the port as soon as the container starts, but
+    %% the process inside may not be serving yet. Probe with an actual
+    %% HTTP HEAD-ish request and wait for bytes back.
+    case gen_tcp:connect(Host, Port, [binary, {active, false}], 200) of
+        {ok, S} ->
+            gen_tcp:send(S, <<"GET / HTTP/1.0\r\nHost: probe\r\n\r\n">>),
+            R = gen_tcp:recv(S, 0, 200),
+            gen_tcp:close(S),
+            case R of
+                {ok, _} -> ok;
+                _ ->
+                    timer:sleep(100),
+                    wait_ready(Host, Port, N - 1)
+            end;
         {error, _} ->
             timer:sleep(100),
             wait_ready(Host, Port, N - 1)
@@ -257,6 +320,8 @@ collect_response(Conn, Id) ->
 
 collect_response(Conn, Id, Status, Hs, Body) ->
     receive
+        {h1, Conn, connected} ->
+            collect_response(Conn, Id, Status, Hs, Body);
         {h1, Conn, {response, Id, S, H}} ->
             collect_response(Conn, Id, S, H, Body);
         {h1, Conn, {informational, Id, _, _}} ->
@@ -273,30 +338,3 @@ collect_response(Conn, Id, Status, Hs, Body) ->
         ct:fail({response_timeout, Status, Hs, Body})
     end.
 
-make_nginx_config(PrivDir, Port) ->
-    Prefix = filename:join(PrivDir, "nginx"),
-    ConfDir = filename:join(Prefix, "conf"),
-    Html = filename:join(Prefix, "html"),
-    Logs = filename:join(Prefix, "logs"),
-    lists:foreach(fun filelib:ensure_dir/1,
-                  [filename:join(ConfDir, "."),
-                   filename:join(Html,    "."),
-                   filename:join(Logs,    ".")]),
-    file:write_file(filename:join(Html, "index.html"),
-                    <<"hello from nginx\n">>),
-    Conf = iolist_to_binary(io_lib:format(
-        "worker_processes 1;\n"
-        "error_log stderr warn;\n"
-        "pid ~s/nginx.pid;\n"
-        "events { worker_connections 64; }\n"
-        "http {\n"
-        "  access_log off;\n"
-        "  server {\n"
-        "    listen 127.0.0.1:~w;\n"
-        "    root ~s;\n"
-        "    location / { index index.html; }\n"
-        "  }\n"
-        "}\n",
-        [Logs, Port, Html])),
-    ok = file:write_file(filename:join(ConfDir, "nginx.conf"), Conf),
-    {ConfDir, Prefix}.
