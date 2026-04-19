@@ -547,6 +547,8 @@ Register it as a Ranch protocol:
 
 Ranch owns draining, acceptor-pool sizing, and metrics; `h1_connection` handles HTTP/1.1 semantics.
 
+For a production-shaped protocol module (per-request handler supervision, pipeline ordering, Upgrade passthrough, TLS ALPN multiplexing of `h1` + `h2` on one port, graceful drain) see [docs/ranch.md](docs/ranch.md).
+
 ## Modules
 
 | Module | Purpose |
