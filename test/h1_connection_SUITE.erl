@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %%% @doc Loopback end-to-end tests for h1_connection gen_statem.
 %%%
 %%% We wire two h1_connection processes (client mode + server mode)

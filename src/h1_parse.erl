@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %% @doc HTTP/1.1 parser facade.
 %%
 %% Dispatches to the pure-Erlang implementation in h1_parse_erl. A future

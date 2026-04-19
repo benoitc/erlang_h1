@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %%% -*- erlang -*-
 %%%
 %%% Streaming pure-Erlang HTTP/1.1 parser.

@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %% @doc HTTP/1.1 error reason classification.
 %%
 %% H1 has no on-the-wire error code frame (unlike H2's RST_STREAM), so

@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %% @doc HTTP/1.1 acceptor loop.
 %%
 %% One lightweight process per acceptor. Blocks on accept against a

@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %%% @doc End-to-end test: drive our h1 client against a Ranch listener
 %%% whose protocol module embeds an `h1_connection'. Verifies the
 %%% acceptor-handoff pattern documented in `docs/ranch.md'.

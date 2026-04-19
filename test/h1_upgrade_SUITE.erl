@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %%% @doc End-to-end tests for HTTP/1.1 Upgrade + RFC 9297 capsule
 %%% passthrough over a real loopback TCP socket.
 -module(h1_upgrade_SUITE).

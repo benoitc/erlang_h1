@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %% @doc QUIC-style Variable-Length Integer Encoding (RFC 9000 Section 16)
 %%
 %% Used by the HTTP Capsule Protocol (RFC 9297). Integers use a

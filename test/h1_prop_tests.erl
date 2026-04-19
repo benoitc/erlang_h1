@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %%% @doc PropEr properties for the H1 parser + encoder.
 %%%
 %%% The central property: for every well-formed request/response/chunk

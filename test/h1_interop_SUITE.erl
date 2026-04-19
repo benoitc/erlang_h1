@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %%% @doc Interoperability tests: our server against curl, our client
 %%% against python3 http.server and nginx. Each case probes for its
 %%% external tool via `os:find_executable/1' and is skipped when the

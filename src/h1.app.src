@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 {application, h1,
  [{description, "HTTP/1.1 protocol library for Erlang"},
   {vsn, "0.2.1"},

@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %%% @doc RFC 9110 / RFC 9112 compliance vectors.
 %%%
 %%% Curated from three public sources:

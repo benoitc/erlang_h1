@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %% @doc HTTP/1.1 public API.
 %%
 %% Mirrors the surface of `h2' (HTTP/2) and `quic_h3' (HTTP/3) so

@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %% @doc HTTP/1.1 server connection loop.
 %%
 %% Each accepted connection spawns an h1_server process. It owns the

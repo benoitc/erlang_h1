@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %%% @doc Encoder round-trip tests: everything we emit must parse back.
 -module(h1_message_SUITE).
 

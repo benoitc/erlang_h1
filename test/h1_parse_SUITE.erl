@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %%% @doc Common Test suite for the HTTP/1.1 streaming parser.
 -module(h1_parse_SUITE).
 

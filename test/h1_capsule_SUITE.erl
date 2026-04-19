@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %%% @doc Capsule codec tests (mirrors erlang_h2's h2_capsule_SUITE).
 -module(h1_capsule_SUITE).
 

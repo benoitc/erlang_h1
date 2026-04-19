@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %% @doc HTTP/1.1 connection gen_statem.
 %%
 %% Owns a single TCP or TLS socket and drives the h1_parse_erl parser in

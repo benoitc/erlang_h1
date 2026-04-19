@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %%% @doc End-to-end tests for h1:start_server/h1:connect over real
 %%% gen_tcp (and TLS with a self-signed cert).
 -module(h1_e2e_SUITE).

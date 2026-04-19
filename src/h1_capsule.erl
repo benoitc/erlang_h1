@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %% @doc RFC 9297 Capsule Protocol codec over a byte stream.
 %%
 %% Capsules convey control information inside any HTTP tunnel. Format:

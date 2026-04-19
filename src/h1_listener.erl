@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %% @doc HTTP/1.1 listener: owns the listen socket and supervises the
 %% acceptor pool. Runs under `h1_sup' so the listener outlives the
 %% process that called `h1:start_server/2'.

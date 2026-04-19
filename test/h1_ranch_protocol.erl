@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %%% @doc Reference Ranch protocol module wiring an h1_connection to an
 %%% accepted socket. Used by `h1_ranch_SUITE' but also a runnable
 %%% example of the shape documented in `docs/ranch.md'.

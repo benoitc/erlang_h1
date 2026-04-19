@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %% @doc HTTP/1.1 client connect helpers.
 %%
 %% Opens a TCP or TLS socket, starts an h1_connection in client mode,

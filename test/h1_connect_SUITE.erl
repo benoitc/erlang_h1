@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau.
+%% SPDX-License-Identifier: Apache-2.0
+%%
 %%% @doc End-to-end tests for `h1:accept_connect/3,4': classic HTTP/1.1
 %%% CONNECT with 200 Connection Established and raw socket handoff
 %%% (RFC 9110 §9.3.6, RFC 9112 §3.2.3).
