@@ -4,6 +4,40 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.2.2] - 2026-05-20
+
+### Security
+
+- Reject chunked bodies whose declared chunk size exceeds `max_body_size`
+  before buffering, and cap the chunk-extension scan at 4096 bytes. Both
+  paths previously let a peer grow the parser buffer without bound.
+- Enforce `max_empty_lines` using the parser's persistent counter so a
+  peer can no longer bypass the limit by dripping one blank line per packet
+  (bare-CRLF lines are now counted too).
+- Keep the socket passive after an Upgrade / CONNECT is detected until the
+  handler accepts, so tunnel bytes are no longer re-parsed as HTTP.
+- `recv_capsule/4` now honors the overall timeout across reads and caps the
+  partial buffer at 16 MB (`capsule_too_large`).
+- Acceptor backs off on unknown accept errors instead of spinning at 100% CPU.
+
+### Fixed
+
+- `wait_connected/1,2` could hang: waiters were stored with a malformed
+  reply tag, so `gen_statem:reply` never reached the caller.
+- Server stream map leaked one closed-stream entry per keep-alive request;
+  streams are now dropped once both directions finish.
+- Chunked response framing over a non-chunked `Transfer-Encoding` now
+  appends `chunked` to the header so it matches the wire bytes.
+- Partial response status line returns `more` instead of `bad_request`.
+- Connection policy (keep-alive / close) is resolved before the `request`
+  event is emitted, so handlers see consistent state.
+- Server loop notifies the handler with `stream_reset` when the connection
+  dies mid-stream, preventing an orphaned handler from hanging.
+- `stop_server/1` erases the `persistent_term` entry created by
+  `start_server/3`.
+- `set_active_once` synthesizes a close event when re-arming the socket
+  fails, so the connection shuts down promptly instead of stalling.
+
 ## [0.2.1] - 2026-04-19
 
 ### Fixed
@@ -115,3 +149,4 @@ Initial release.
 [0.1.1]: https://github.com/benoitc/erlang_h1/releases/tag/0.1.1
 [0.2.0]: https://github.com/benoitc/erlang_h1/releases/tag/0.2.0
 [0.2.1]: https://github.com/benoitc/erlang_h1/releases/tag/0.2.1
+[0.2.2]: https://github.com/benoitc/erlang_h1/releases/tag/0.2.2
