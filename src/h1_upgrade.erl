@@ -21,6 +21,11 @@
 -export([recv_capsule/3, recv_capsule/4]).
 -export([close/2]).
 
+%% Upper bound on a partial capsule held in memory while we wait for the
+%% rest to arrive. A peer that dribbles bytes without ever completing a
+%% capsule can't grow this past the cap.
+-define(MAX_CAPSULE_BUFFER, 16#1000000). %% 16 MB
+
 -type transport() :: gen_tcp | ssl.
 -type socket() :: gen_tcp:socket() | ssl:sslsocket().
 -type capsule() :: {atom() | non_neg_integer(), binary()}.
@@ -46,19 +51,40 @@ recv_capsule(Transport, Socket, Buffer) ->
 -spec recv_capsule(transport(), socket(), binary(), timeout()) ->
     {ok, capsule(), binary()} | {error, term()}.
 recv_capsule(Transport, Socket, Buffer, Timeout) ->
+    Deadline = deadline(Timeout),
+    recv_capsule_loop(Transport, Socket, Buffer, Deadline).
+
+recv_capsule_loop(Transport, Socket, Buffer, Deadline) ->
     case h1_capsule:decode(Buffer) of
         {ok, Capsule, Rest} ->
             {ok, Capsule, Rest};
+        {more, _} when byte_size(Buffer) >= ?MAX_CAPSULE_BUFFER ->
+            {error, capsule_too_large};
         {more, _} ->
-            case recv(Transport, Socket, Timeout) of
-                {ok, Bin} ->
-                    recv_capsule(Transport, Socket,
-                                 <<Buffer/binary, Bin/binary>>, Timeout);
-                {error, Reason} ->
-                    {error, Reason}
+            case remaining(Deadline) of
+                expired -> {error, timeout};
+                Left ->
+                    case recv(Transport, Socket, Left) of
+                        {ok, Bin} ->
+                            recv_capsule_loop(Transport, Socket,
+                                <<Buffer/binary, Bin/binary>>, Deadline);
+                        {error, Reason} ->
+                            {error, Reason}
+                    end
             end;
         {error, Reason} ->
             {error, Reason}
+    end.
+
+deadline(infinity) -> infinity;
+deadline(Timeout) when is_integer(Timeout) ->
+    erlang:monotonic_time(millisecond) + Timeout.
+
+remaining(infinity) -> infinity;
+remaining(Deadline) ->
+    case Deadline - erlang:monotonic_time(millisecond) of
+        Left when Left > 0 -> Left;
+        _ -> expired
     end.
 
 -spec close(transport(), socket()) -> ok.

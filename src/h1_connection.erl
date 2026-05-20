@@ -123,10 +123,14 @@
     goaway_sent = false    :: boolean(),
     %% Connection lifecycle.
     connected_acked = false :: boolean(),
-    wait_connected_waiters = [] :: [{pid(), reference()}],
+    wait_connected_waiters = [] :: [gen_statem:from()],
     %% True once the socket has been controlling_process'd to someone else
     %% (after a successful Upgrade). terminate/3 must not close it then.
     socket_handed_off = false :: boolean(),
+    %% Server: an Upgrade/CONNECT request is awaiting accept_upgrade/
+    %% accept_connect. While true the socket stays passive so bytes that
+    %% belong to the tunnel are not parsed as HTTP.
+    upgrade_pending = false :: boolean(),
     %% Parser limits forwarded from opts.
     parser_opts = []       :: [h1_parse_erl:parser_option()]
 }).
@@ -314,15 +318,13 @@ handle_event({call, From}, activate, idle, State) ->
     {next_state, open, State2, Actions};
 handle_event({call, From}, wait_connected, idle,
              #state{wait_connected_waiters = W} = State) ->
-    Ref = make_ref(),
-    {keep_state, State#state{wait_connected_waiters = [{From, Ref} | W]}};
+    {keep_state, State#state{wait_connected_waiters = [From | W]}};
 handle_event({call, From}, wait_connected, _OtherState,
              #state{connected_acked = true}) ->
     {keep_state_and_data, [{reply, From, ok}]};
 handle_event({call, From}, wait_connected, _OtherState,
              #state{wait_connected_waiters = W} = State) ->
-    Ref = make_ref(),
-    {keep_state, State#state{wait_connected_waiters = [{From, Ref} | W]}};
+    {keep_state, State#state{wait_connected_waiters = [From | W]}};
 
 %% --- socket I/O -------------------------------------------------------------
 
@@ -477,12 +479,19 @@ code_change(_OldVsn, State, Data, _Extra) ->
 %% Socket helpers
 %% ----------------------------------------------------------------------------
 
+%% If re-arming the socket fails (typically because the peer already
+%% closed it), synthesize the matching close event so the state machine
+%% shuts down promptly instead of stalling until idle_timeout.
 set_active_once(#state{socket = S, transport = gen_tcp} = St) ->
-    _ = inet:setopts(S, [{active, once}]),
-    St;
+    case inet:setopts(S, [{active, once}]) of
+        ok -> St;
+        {error, _} -> self() ! {tcp_closed, S}, St
+    end;
 set_active_once(#state{socket = S, transport = ssl} = St) ->
-    _ = ssl:setopts(S, [{active, once}]),
-    St.
+    case ssl:setopts(S, [{active, once}]) of
+        ok -> St;
+        {error, _} -> self() ! {ssl_closed, S}, St
+    end.
 
 set_active_false(#state{socket = S, transport = gen_tcp} = St) ->
     _ = inet:setopts(S, [{active, false}]),
@@ -533,6 +542,12 @@ clear_request_timeout() ->
 
 handle_socket_data(Data, #state{parser = P, mode = Mode} = State) ->
     case drive_parser(h1_parse_erl:execute(P, Data), State, Mode) of
+        {ok, #state{upgrade_pending = true} = State1} ->
+            %% A tunnel handshake is pending: keep the socket passive so
+            %% post-handshake bytes are handed to the new owner intact
+            %% rather than parsed as the next HTTP message.
+            Actions = idle_timeout_actions(State1),
+            {keep_state, set_active_false(State1), Actions};
         {ok, State1} ->
             Actions = idle_timeout_actions(State1)
                       ++ request_timer_actions(State1),
@@ -695,7 +710,7 @@ on_request_headers_complete(Stream1, Headers, State, Id) ->
     case detect_upgrade(State#state.parser, Headers) of
         {upgrade, Proto} ->
             Stream2 = Stream1#stream{state = half_closed_remote},
-            State1 = put_stream(Stream2, State),
+            State1 = put_stream(Stream2, State#state{upgrade_pending = true}),
             notify(State1#state.owner,
                    {upgrade, Id, Proto, Stream1#stream.method,
                     Stream1#stream.path, Headers}, self()),
@@ -705,11 +720,13 @@ on_request_headers_complete(Stream1, Headers, State, Id) ->
             HasExpect = Expect =:= <<"100-continue">>,
             Stream2 = Stream1#stream{expect_continue = HasExpect},
             State1 = put_stream(Stream2, State),
-            notify(State1#state.owner,
-                   {request, Id, Stream1#stream.method,
-                    Stream1#stream.path, Headers}, self()),
+            %% Resolve keep-alive/close policy before handing the request
+            %% to the owner so the handler observes a consistent state.
             State2 = apply_peer_connection_policy(State1, Headers,
                         Stream1#stream.version),
+            notify(State2#state.owner,
+                   {request, Id, Stream1#stream.method,
+                    Stream1#stream.path, Headers}, self()),
             {continue, State2}
     end.
 
@@ -804,23 +821,13 @@ emit_to_owner_or_handler(#stream{handler = undefined}, Event,
                          #state{owner = Owner} = State) ->
     notify(Owner, Event, self()),
     State;
-emit_to_owner_or_handler(#stream{handler = Pid} = Stream, Event, State)
+emit_to_owner_or_handler(#stream{handler = Pid}, Event, State)
     when is_pid(Pid) ->
-    case should_buffer(Event) of
-        true ->
-            Stream1 = Stream#stream{recv_buffer =
-                [Event | Stream#stream.recv_buffer]},
-            put_stream(Stream1, State);
-        false ->
-            Pid ! {h1, self(), Event},
-            State
-    end.
-
-%% For simplicity we never buffer when a handler is already set — data
-%% is always delivered immediately. Buffering is only useful for the
-%% window between stream creation and handler registration; callers that
-%% need backpressure should use blocking send_data.
-should_buffer(_) -> false.
+    %% A handler is set: deliver immediately. Events that arrive before a
+    %% handler is registered go to the owner and, if buffered on the
+    %% stream, are flushed by flush_handler/2 on registration.
+    Pid ! {h1, self(), Event},
+    State.
 
 flush_handler(#stream{recv_buffer = []}, _Handler) -> [];
 flush_handler(#stream{recv_buffer = Buf} = _Stream, Handler)
@@ -855,9 +862,16 @@ finalize_request(Id, State) ->
                     emit_to_owner_or_handler(Stream0,
                         {data, Id, <<>>, true}, State1)
             end,
-            Stream1 = (maps:get(Id, State2#state.streams, Stream0))#stream{
-                state = half_closed_remote, recv_ended = true},
-            State3 = put_stream(Stream1, State2),
+            Stream1 = maps:get(Id, State2#state.streams, Stream0),
+            State3 = case Stream1#stream.state of
+                S when S =:= half_closed_local; S =:= closed ->
+                    %% Response already sent; both sides done — drop it.
+                    State2#state{
+                        streams = maps:remove(Id, State2#state.streams)};
+                _ ->
+                    put_stream(Stream1#stream{state = half_closed_remote,
+                                              recv_ended = true}, State2)
+            end,
             State3#state{requests_served = State3#state.requests_served + 1};
         error -> State
     end.
@@ -901,12 +915,9 @@ mark_stream_ended(#state{current_stream = Id} = State) when Id =/= undefined ->
     end;
 mark_stream_ended(State) -> State.
 
+%% Remove the first occurrence of Id, preserving order of the rest.
 dequeue_id(Id, Q) ->
-    case queue:out(Q) of
-        {{value, Id}, Q1} -> Q1;
-        {{value, Other}, Q1} -> queue:in_r(Other, dequeue_id(Id, Q1));
-        {empty, Q} -> Q
-    end.
+    queue:filter(fun(X) -> X =/= Id end, Q).
 
 reset_parser(#state{mode = server, parser_opts = Opts}) ->
     h1_parse_erl:parser(Opts);
@@ -1034,7 +1045,14 @@ maybe_flush_pending_body(Id, State) ->
 %% Server: send_response, send_data, send_trailers, continue
 %% ----------------------------------------------------------------------------
 
-handle_send_response(From, StreamId, Status, Headers, State) ->
+handle_send_response(From, StreamId, Status, Headers, State0) ->
+    %% Sending a normal response on an upgrade-pending connection means the
+    %% handler declined the Upgrade. Drop the pending flag and resume
+    %% reading the connection.
+    {State, ResumeActions} = case State0#state.upgrade_pending of
+        true  -> {set_active_once(State0#state{upgrade_pending = false}), []};
+        false -> {State0, []}
+    end,
     case maps:find(StreamId, State#state.streams) of
         {ok, Stream} ->
             Framing = framing_of_response(Headers),
@@ -1047,7 +1065,7 @@ handle_send_response(From, StreamId, Status, Headers, State) ->
             case sock_send(State, Wire) of
                 ok ->
                     State1 = put_stream(Stream1, State),
-                    {keep_state, State1, [{reply, From, ok}]};
+                    {keep_state, State1, [{reply, From, ok} | ResumeActions]};
                 {error, R} ->
                     {keep_state_and_data, [{reply, From, {error, R}}]}
             end;
@@ -1057,12 +1075,26 @@ handle_send_response(From, StreamId, Status, Headers, State) ->
 
 augment_response_headers(Headers, chunked, State) ->
     H1 = case lookup_ci(<<"transfer-encoding">>, Headers) of
-        undefined -> Headers ++ [{<<"transfer-encoding">>, <<"chunked">>}];
-        _ -> Headers
+        undefined ->
+            Headers ++ [{<<"transfer-encoding">>, <<"chunked">>}];
+        TE ->
+            case has_token(h1_parse_erl:to_lower(TE), <<"chunked">>) of
+                true  -> Headers;
+                %% We frame the body as chunked, so the advertised
+                %% Transfer-Encoding must end with `chunked' (RFC 9112
+                %% §6.1) or the peer will mis-frame the response.
+                false -> append_chunked_te(Headers)
+            end
     end,
     ensure_close_header(H1, State);
 augment_response_headers(Headers, _, State) ->
     ensure_close_header(Headers, State).
+
+append_chunked_te(Headers) ->
+    [case h1_parse_erl:to_lower(N) of
+         <<"transfer-encoding">> -> {N, [V, <<", chunked">>]};
+         _ -> {N, V}
+     end || {N, V} <- Headers].
 
 framing_of_response(Headers) ->
     case {lookup_ci(<<"content-length">>, Headers),
@@ -1132,8 +1164,14 @@ frame_body(#stream{}, Data, _EndStream) ->
 
 maybe_close_server_stream(StreamId, #state{mode = server} = State) ->
     case maps:find(StreamId, State#state.streams) of
+        {ok, #stream{state = half_closed_local, recv_ended = true}} ->
+            %% Both directions done — drop the stream so the map does not
+            %% grow one zombie entry per keep-alive request.
+            State#state{streams = maps:remove(StreamId, State#state.streams)};
         {ok, #stream{state = half_closed_local} = S} ->
-            %% Response done. If request body also done we can drop the stream.
+            %% Response finished before the request body was fully read.
+            %% Keep the stream; finalize_request removes it once draining
+            %% completes.
             put_stream(S#stream{state = closed}, State);
         _ -> State
     end;

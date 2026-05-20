@@ -41,6 +41,9 @@ loop(#{transport := Transport, listen_socket := ListenSocket} = Args) ->
             timer:sleep(?ACCEPT_BACKOFF),
             loop(Args);
         {error, _Reason} ->
+            %% Unknown transient error — back off briefly so a persistent
+            %% failure can't spin this process at 100% CPU.
+            timer:sleep(?ACCEPT_BACKOFF),
             loop(Args)
     end.
 

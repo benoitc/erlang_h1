@@ -171,12 +171,13 @@ execute(#h1_parser{state = State, buffer = Buf} = St, Bin) ->
 %% First line
 %% ----------------------------------------------------------------------------
 
-%% Skip leading bare LF empty lines (RFC 9112 §2.2 tolerance).
-parse_first_line(<<$\n, Rest/binary>>,
-                 #h1_parser{empty_lines = E0} = St, _Empty) ->
-    parse_first_line(Rest, St#h1_parser{buffer = Rest, empty_lines = E0 + 1}, E0 + 1);
-parse_first_line(_Buf, #h1_parser{max_empty_lines = Max}, E) when E > Max ->
-    {error, bad_request};
+%% Skip leading empty lines before the start line (RFC 9112 §2.2
+%% tolerance). Both bare-LF and CRLF empty lines are counted against
+%% max_empty_lines, using the parser's persistent counter so the limit
+%% holds across execute/2 feeds (a per-call counter could be reset by
+%% dripping one empty line per packet).
+parse_first_line(<<$\n, Rest/binary>>, St, _Empty) ->
+    bump_empty_line(Rest, St);
 parse_first_line(Buf, #h1_parser{max_line_length = Max} = St, _Empty) ->
     case match_eol(Buf, 0) of
         nomatch when byte_size(Buf) > Max ->
@@ -186,10 +187,16 @@ parse_first_line(Buf, #h1_parser{max_line_length = Max} = St, _Empty) ->
         1 ->
             %% bare \r\n — empty line, advance and keep waiting.
             <<_:16, Rest/binary>> = Buf,
-            parse_first_line(Rest, St#h1_parser{buffer = Rest}, 0);
+            bump_empty_line(Rest, St);
         _ ->
             dispatch_first_line(St)
     end.
+
+bump_empty_line(_Rest, #h1_parser{empty_lines = E, max_empty_lines = Max})
+    when E >= Max ->
+    {error, bad_request};
+bump_empty_line(Rest, #h1_parser{empty_lines = E} = St) ->
+    parse_first_line(Rest, St#h1_parser{buffer = Rest, empty_lines = E + 1}, 0).
 
 dispatch_first_line(#h1_parser{type = request} = St) ->
     parse_request_line(St);
@@ -266,8 +273,10 @@ strip_crlf(_)                       -> error.
 parse_response_line(#h1_parser{buffer = B} = St) ->
     parse_response_line_sep([<<"\r\n">>, <<"\n">>], B, St).
 
-parse_response_line_sep([], _B, _St) ->
-    {error, bad_request};
+%% No EOL found yet: the status line is incomplete, ask for more bytes
+%% rather than declaring the message malformed.
+parse_response_line_sep([], _B, St) ->
+    {more, St};
 parse_response_line_sep([Sep | Rest], B, St) ->
     case binary:split(B, Sep) of
         [Line, Tail] ->
@@ -558,9 +567,10 @@ parse_body(#h1_parser{body_framing = no_body, buffer = B}) ->
 parse_body(#h1_parser{body_framing = undefined} = St) ->
     %% Compute lazily if finalize_framing wasn't called (auto mode).
     parse_body(St#h1_parser{body_framing = pick_framing(St)});
-parse_body(#h1_parser{body_state = waiting, body_framing = chunked} = St) ->
+parse_body(#h1_parser{body_state = waiting, body_framing = chunked,
+                      max_body_size = Max} = St) ->
     parse_body(St#h1_parser{body_state =
-        {stream, fun te_chunked/2, waiting_size, fun ce_identity/1}});
+        {stream, fun te_chunked/2, {waiting_size, Max}, fun ce_identity/1}});
 parse_body(#h1_parser{body_state = waiting,
                       body_framing = {content_length, 0}, buffer = B}) ->
     {done, B};
@@ -684,9 +694,14 @@ te_close(Data, _State) -> {ok, Data, undefined}.
 %% --- chunked body decoder ---------------------------------------------------
 
 te_chunked(<<>>, _) -> more;
-te_chunked(Data, _State) ->
+te_chunked(Data, {waiting_size, Max}) ->
     case read_size(Data) of
         {ok, 0, Rest} -> {chunk_done, Rest};
+        %% Reject a chunk whose declared size alone exceeds the whole
+        %% body budget: otherwise the parser would buffer that many raw
+        %% bytes before enforce_body_size/2 ever runs on the chunk.
+        {ok, Size, _Rest} when Max =/= infinity, Size > Max ->
+            {error, body_too_large};
         {ok, Size, Rest} ->
             case read_chunk(Rest, Size) of
                 {ok, Chunk, Rest2} -> {chunk_ok, Chunk, Rest2};
@@ -706,9 +721,9 @@ read_size(<<"\n", Rest/binary>>, Size, Len) when Len > 0 ->
 read_size(<<"\r\n", _/binary>>, _, 0) -> eof;
 read_size(<<"\n", _/binary>>, _, 0) -> eof;
 read_size(<<$;, Rest/binary>>, Size, Len) when Len > 0 ->
-    skip_ext(Rest, Size);
+    skip_ext(Rest, Size, 0);
 read_size(<<$\s, Rest/binary>>, Size, Len) when Len > 0 ->
-    skip_ext(Rest, Size);
+    skip_ext(Rest, Size, 0);
 %% DoS guard: a chunk-size line with more than 16 hex digits describes a
 %% body larger than any 64-bit size and is almost certainly hostile.
 read_size(<<C, _/binary>>, _, Len)
@@ -726,10 +741,14 @@ read_size(<<C, Rest/binary>>, Size, Len) when C >= $A, C =< $F ->
 read_size(_, _, _) ->
     {error, invalid_chunk_size}.
 
-skip_ext(<<"\r\n", Rest/binary>>, Size) -> {ok, Size, Rest};
-skip_ext(<<"\n", Rest/binary>>, Size) -> {ok, Size, Rest};
-skip_ext(<<>>, _) -> eof;
-skip_ext(<<_, Rest/binary>>, Size) -> skip_ext(Rest, Size).
+skip_ext(<<"\r\n", Rest/binary>>, Size, _Len) -> {ok, Size, Rest};
+skip_ext(<<"\n", Rest/binary>>, Size, _Len) -> {ok, Size, Rest};
+skip_ext(<<>>, _, _Len) -> eof;
+%% DoS guard: a chunk-extension that never terminates would otherwise
+%% let the buffer grow without bound while we scan for CRLF.
+skip_ext(_, _, Len) when Len >= ?H1_MAX_CHUNK_EXT_SIZE ->
+    {error, chunk_size_too_long};
+skip_ext(<<_, Rest/binary>>, Size, Len) -> skip_ext(Rest, Size, Len + 1).
 
 read_chunk(Data, Size) ->
     case Data of

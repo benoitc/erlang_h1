@@ -110,9 +110,13 @@ pump(Conn, Handler, Pid, MRef, StreamId) ->
             pump(Conn, Handler, Pid, MRef, StreamId);
         {'DOWN', MRef, process, Pid, _Reason} ->
             connection_loop(Conn, Handler);
-        {h1, Conn, {closed, _Reason}} ->
+        {h1, Conn, {closed, Reason}} ->
+            %% Connection gone mid-stream: unblock the handler (which may be
+            %% waiting for the next {h1_stream, _} body chunk) before exiting.
+            Pid ! {h1_stream, StreamId, {stream_reset, Reason}},
             ok;
-        {'EXIT', Conn, _Reason} ->
+        {'EXIT', Conn, Reason} ->
+            Pid ! {h1_stream, StreamId, {stream_reset, Reason}},
             ok
     end.
 

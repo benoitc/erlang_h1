@@ -19,6 +19,7 @@
 -define(H1_MAX_LINE_LENGTH,       16384).     %% hackney default
 -define(H1_MAX_EMPTY_LINES,       10).
 -define(H1_MAX_CHUNK_SIZE_HEX,    16).         %% 64-bit max, way past any legit chunk
+-define(H1_MAX_CHUNK_EXT_SIZE,    4096).       %% cap chunk-extension scan (DoS guard)
 
 %% ----------------------------------------------------------------------------
 %% HTTP versions

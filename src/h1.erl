@@ -250,8 +250,17 @@ close_listen(gen_tcp, S) -> _ = gen_tcp:close(S), ok;
 close_listen(ssl, S) -> _ = ssl:close(S), ok.
 
 -spec stop_server(server_ref()) -> ok.
-stop_server({Pid, Ref, _Port}) ->
+stop_server({Pid, Ref, _Port} = ServerRef) ->
+    erase_server_term(ServerRef),
     h1_listener:stop(Pid, Ref).
+
+%% Drop any name->ref registration made by start_server/3 so repeated
+%% start/stop cycles don't leak persistent_term entries.
+erase_server_term(ServerRef) ->
+    _ = [persistent_term:erase(K)
+         || {{?MODULE, server, _} = K, V} <- persistent_term:get(),
+            V =:= ServerRef],
+    ok.
 
 -spec server_port(server_ref()) -> inet:port_number().
 server_port({_, _, Port}) -> Port.
