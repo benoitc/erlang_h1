@@ -45,7 +45,7 @@ init_per_testcase(TC, Config) ->
 end_per_testcase(_TC, Config) ->
     case ?config(server_ref, Config) of
         undefined -> ok;
-        Ref -> catch h1:stop_server(Ref)
+        Ref -> try h1:stop_server(Ref) catch _:_ -> ok end
     end,
     case ?config(docker_container, Config) of
         undefined -> ok;
@@ -293,7 +293,7 @@ collect_port_output(Port, Acc) ->
         {Port, {exit_status, Code}} ->
             {binary_to_list(Acc), Code}
     after 30000 ->
-        catch erlang:port_close(Port),
+        try erlang:port_close(Port) catch _:_ -> ok end,
         {binary_to_list(Acc), timeout}
     end.
 

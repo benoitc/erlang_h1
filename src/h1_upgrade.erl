@@ -71,9 +71,7 @@ recv_capsule_loop(Transport, Socket, Buffer, Deadline) ->
                         {error, Reason} ->
                             {error, Reason}
                     end
-            end;
-        {error, Reason} ->
-            {error, Reason}
+            end
     end.
 
 deadline(infinity) -> infinity;

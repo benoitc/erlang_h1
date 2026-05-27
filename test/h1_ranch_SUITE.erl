@@ -43,7 +43,7 @@ init_per_testcase(TC, Config) ->
     [{listener, list_to_atom("h1_ranch_" ++ atom_to_list(TC))} | Config].
 
 end_per_testcase(_TC, Config) ->
-    catch ranch:stop_listener(?config(listener, Config)),
+    try ranch:stop_listener(?config(listener, Config)) catch _:_ -> ok end,
     ok.
 
 %% ----------------------------------------------------------------------------
