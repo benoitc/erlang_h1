@@ -83,7 +83,7 @@
     %% Did we already emit end_stream=true for incoming body data?
     recv_ended = false    :: boolean(),
     %% Client synchronous upgrade bookkeeping.
-    upgrade_from          :: undefined | {pid(), reference()},
+    upgrade_from          :: undefined | gen_statem:from(),
     upgrade_protocol      :: undefined | binary(),
     closed_reason         :: undefined | reason()
 }).
@@ -427,7 +427,7 @@ handle_event({call, From}, {send_goaway, _Reason}, _S, State) ->
 handle_event({call, From}, {cancel_stream, StreamId, _Reason}, _S, State) ->
     State1 = case maps:find(StreamId, State#state.streams) of
         {ok, Stream} ->
-            emit_to_owner_or_handler(Stream,
+            _ = emit_to_owner_or_handler(Stream,
                 {stream_reset, StreamId, cancel}, State),
             put_stream(Stream#stream{state = closed, closed_reason = cancel}, State);
         error -> State
@@ -435,10 +435,7 @@ handle_event({call, From}, {cancel_stream, StreamId, _Reason}, _S, State) ->
     {keep_state, State1#state{close_after = true}, [{reply, From, ok}]};
 
 handle_event({call, From}, {controlling_process, NewOwner}, _S, State) ->
-    _ = case State#state.owner_ref of
-        undefined -> ok;
-        OldRef -> erlang:demonitor(OldRef, [flush])
-    end,
+    _ = erlang:demonitor(State#state.owner_ref, [flush]),
     NewRef = erlang:monitor(process, NewOwner),
     {keep_state, State#state{owner = NewOwner, owner_ref = NewRef},
      [{reply, From, ok}]};
@@ -465,9 +462,9 @@ handle_event(_EventType, _Event, _S, _State) ->
 
 terminate(Reason, _State, #state{socket = Socket, transport = T, owner = Owner,
                                  socket_handed_off = HandedOff}) ->
-    catch notify(Owner, {closed, Reason}, self()),
-    case HandedOff of
-        false -> catch close_socket(T, Socket);
+    try notify(Owner, {closed, Reason}, self()) catch _:_ -> ok end,
+    _ = case HandedOff of
+        false -> try close_socket(T, Socket) catch _:_ -> ok end;
         true  -> ok
     end,
     ok.
@@ -554,8 +551,6 @@ handle_socket_data(Data, #state{parser = P, mode = Mode} = State) ->
             {keep_state, set_active_once(State1), Actions};
         {upgrade_client, Stream, NewParser, State1} ->
             complete_client_upgrade(Stream, NewParser, State1);
-        {closed, Reason, State1} ->
-            handle_socket_closed(State1, Reason);
         {error, Reason, State1} ->
             {stop, {shutdown, Reason}, State1}
     end.
@@ -699,7 +694,7 @@ on_headers_complete(#state{mode = client, current_stream = Id} = State, client) 
             {continue, reset_parser_for_response(State1, Id)};
         _ ->
             State1 = put_stream(Stream1, State),
-            emit_to_owner_or_handler_lookup(Id,
+            _ = emit_to_owner_or_handler_lookup(Id,
                 {response, Id, Status, Headers}, State1),
             State2 = apply_peer_connection_policy(State1, Headers,
                         Stream1#stream.version),

@@ -42,7 +42,7 @@ init_per_testcase(_TC, Config) -> Config.
 end_per_testcase(_TC, Config) ->
     case ?config(server_ref, Config) of
         undefined -> ok;
-        Ref -> catch h1:stop_server(Ref)
+        Ref -> try h1:stop_server(Ref) catch _:_ -> ok end
     end,
     ok.
 

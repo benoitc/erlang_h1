@@ -45,10 +45,10 @@ run_connection(Socket, Transport, Handler, ConnOpts) ->
                         ok ->
                             connection_loop(Conn, Handler);
                         {error, _} ->
-                            catch h1_connection:close(Conn)
+                            try h1_connection:close(Conn) catch _:_ -> ok end
                     end;
                 {error, _} ->
-                    catch h1_connection:close(Conn),
+                    try h1_connection:close(Conn) catch _:_ -> ok end,
                     close(Transport, Socket)
             end;
         {error, _Reason} ->
@@ -128,12 +128,14 @@ start_handler(Conn, StreamId, Method, Path, Headers, Handler) ->
             Class:Reason:Stack ->
                 error_logger:error_msg("h1 handler crashed: ~p:~p~n~p~n",
                                        [Class, Reason, Stack]),
-                catch h1_connection:send_response(
-                    Conn, StreamId, 500,
-                    [{<<"content-length">>, <<"21">>},
-                     {<<"content-type">>, <<"text/plain">>}]),
-                catch h1_connection:send_data(
-                    Conn, StreamId, <<"Internal Server Error">>, true)
+                try
+                    h1_connection:send_response(
+                        Conn, StreamId, 500,
+                        [{<<"content-length">>, <<"21">>},
+                         {<<"content-type">>, <<"text/plain">>}]),
+                    h1_connection:send_data(
+                        Conn, StreamId, <<"Internal Server Error">>, true)
+                catch _:_ -> ok end
         end
     end).
 

@@ -78,11 +78,11 @@ start_connection(Host, Socket, Transport, Opts, Timeout) ->
                     case h1_connection:wait_connected(Pid, Timeout) of
                         ok -> {ok, Pid};
                         {error, Reason} ->
-                            catch h1_connection:close(Pid),
+                            try h1_connection:close(Pid) catch _:_ -> ok end,
                             {error, Reason}
                     end;
                 {error, TReason} ->
-                    catch h1_connection:close(Pid),
+                    try h1_connection:close(Pid) catch _:_ -> ok end,
                     close(Transport, Socket),
                     {error, {controlling_process_failed, TReason}}
             end;
@@ -95,7 +95,6 @@ transfer(gen_tcp, Socket, Pid) -> gen_tcp:controlling_process(Socket, Pid);
 transfer(ssl, Socket, Pid) -> ssl:controlling_process(Socket, Pid).
 
 peer_host_bin(Host) when is_list(Host)   -> iolist_to_binary(Host);
-peer_host_bin(Host) when is_binary(Host) -> Host;
 peer_host_bin(Host) when is_tuple(Host)  ->
     iolist_to_binary(inet:ntoa(Host));
 peer_host_bin(_) -> undefined.

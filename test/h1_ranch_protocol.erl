@@ -31,7 +31,7 @@ init(Ref, Transport, #{handler := Handler} = Opts) ->
             ok = h1_connection:activate(Conn),
             loop(Conn, Handler);
         {error, _} = E ->
-            catch h1_connection:close(Conn),
+            try h1_connection:close(Conn) catch _:_ -> ok end,
             exit({controlling_process, E})
     end.
 
@@ -74,10 +74,12 @@ start_handler(Conn, Id, Method, Path, Headers, Handler) ->
         catch Class:Reason:Stack ->
             error_logger:error_msg("ranch-h1 handler crash ~p:~p~n~p~n",
                                    [Class, Reason, Stack]),
-            catch h1:send_response(Conn, Id, 500,
+            try h1:send_response(Conn, Id, 500,
                 [{<<"content-length">>, <<"21">>},
-                 {<<"content-type">>, <<"text/plain">>}]),
-            catch h1:send_data(Conn, Id, <<"Internal Server Error">>, true)
+                 {<<"content-type">>, <<"text/plain">>}])
+            catch _:_ -> ok end,
+            try h1:send_data(Conn, Id, <<"Internal Server Error">>, true)
+            catch _:_ -> ok end
         end
     end).
 
