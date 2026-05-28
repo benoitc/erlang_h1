@@ -264,10 +264,14 @@ split_curl(Out) ->
 docker_run(ExtraArgs, ContainerPort) ->
     Args = ["run", "-d", "--rm"] ++ ExtraArgs,
     {Out, 0} = run_docker(Args),
-    Cid = string:trim(Out),
-    case Cid of
+    %% When the image isn't cached locally `docker run -d' prints pull
+    %% progress (merged here from stderr) before the container id, so the
+    %% id is the last non-empty output line, not the whole buffer.
+    case [L || L <- string:split(string:trim(Out), "\n", all), L =/= ""] of
         [] -> ct:fail({docker_run_failed, Args, Out});
-        _  -> {Cid, docker_host_port(Cid, ContainerPort)}
+        Lines ->
+            Cid = lists:last(Lines),
+            {Cid, docker_host_port(Cid, ContainerPort)}
     end.
 
 docker_host_port(Cid, ContainerPort) ->
