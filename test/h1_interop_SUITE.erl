@@ -45,7 +45,7 @@ init_per_testcase(TC, Config) ->
 end_per_testcase(_TC, Config) ->
     case ?config(server_ref, Config) of
         undefined -> ok;
-        Ref -> catch h1:stop_server(Ref)
+        Ref -> try h1:stop_server(Ref) catch _:_ -> ok end
     end,
     case ?config(docker_container, Config) of
         undefined -> ok;
@@ -264,10 +264,14 @@ split_curl(Out) ->
 docker_run(ExtraArgs, ContainerPort) ->
     Args = ["run", "-d", "--rm"] ++ ExtraArgs,
     {Out, 0} = run_docker(Args),
-    Cid = string:trim(Out),
-    case Cid of
+    %% When the image isn't cached locally `docker run -d' prints pull
+    %% progress (merged here from stderr) before the container id, so the
+    %% id is the last non-empty output line, not the whole buffer.
+    case [L || L <- string:split(string:trim(Out), "\n", all), L =/= ""] of
         [] -> ct:fail({docker_run_failed, Args, Out});
-        _  -> {Cid, docker_host_port(Cid, ContainerPort)}
+        Lines ->
+            Cid = lists:last(Lines),
+            {Cid, docker_host_port(Cid, ContainerPort)}
     end.
 
 docker_host_port(Cid, ContainerPort) ->
@@ -293,7 +297,7 @@ collect_port_output(Port, Acc) ->
         {Port, {exit_status, Code}} ->
             {binary_to_list(Acc), Code}
     after 30000 ->
-        catch erlang:port_close(Port),
+        try erlang:port_close(Port) catch _:_ -> ok end,
         {binary_to_list(Acc), timeout}
     end.
 
