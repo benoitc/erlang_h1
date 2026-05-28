@@ -73,8 +73,8 @@ init_per_testcase(_TC, Config) ->
     [{client_sock, ClientSock}, {server_sock, ServerSock} | Config].
 
 end_per_testcase(_TC, Config) ->
-    catch gen_tcp:close(?config(client_sock, Config)),
-    catch gen_tcp:close(?config(server_sock, Config)),
+    try gen_tcp:close(?config(client_sock, Config)) catch _:_ -> ok end,
+    try gen_tcp:close(?config(server_sock, Config)) catch _:_ -> ok end,
     ok.
 
 %% ----------------------------------------------------------------------------
@@ -373,7 +373,7 @@ idle_timeout_closes_silent_connection(Config) ->
     %% No data → idle timer should fire and stop the connection.
     %% terminate/3 emits a `{closed, Reason}' event with the stop reason.
     ok = wait_for_closed(Client, idle_timeout, 2000),
-    catch h1_connection:close(Client).
+    try h1_connection:close(Client) catch _:_ -> ok end.
 
 wait_for_closed(Conn, Tag, Timeout) ->
     receive
@@ -433,7 +433,7 @@ server_rejects_1_1_request_without_host_with_400(Config) ->
     {ok, Resp} = gen_tcp:recv(ClientSock, 0, 1000),
     ?assertMatch(<<"HTTP/1.1 400 ", _/binary>>, Resp),
     ?assertMatch({match, _}, re:run(Resp, <<"(?i)connection: close">>)),
-    catch h1_connection:close(Server).
+    try h1_connection:close(Server) catch _:_ -> ok end.
 
 close_delimited_response_terminates_on_eof(Config) ->
     ClientSock = ?config(client_sock, Config),
@@ -458,7 +458,7 @@ close_delimited_response_terminates_on_eof(Config) ->
     {response, _, 200, _} = receive_h1(Client, 1000),
     Body = collect_body(Client, <<>>),
     ?assertEqual(<<"streaming payload">>, Body),
-    catch h1_connection:close(Client).
+    try h1_connection:close(Client) catch _:_ -> ok end.
 
 collect_body(Conn, Acc) ->
     receive
@@ -502,8 +502,8 @@ start_pair(Config) ->
     {Client, Server}.
 
 stop_pair(Client, Server) ->
-    catch h1_connection:close(Client),
-    catch h1_connection:close(Server),
+    try h1_connection:close(Client) catch _:_ -> ok end,
+    try h1_connection:close(Server) catch _:_ -> ok end,
     %% Drain any final {closed, _} notifications to avoid leaking messages
     %% into the next test.
     flush_h1(),

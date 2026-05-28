@@ -67,7 +67,7 @@ spawn_connection(Socket, #{transport := Transport,
             Pid;
         {error, _Reason} ->
             Pid ! {h1_acceptor, transfer_failed},
-            close(Transport, Socket),
+            _ = close(Transport, Socket),
             Pid
     end.
 
