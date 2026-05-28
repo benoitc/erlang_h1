@@ -4,6 +4,22 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.2.3] - 2026-05-28
+
+### Changed
+
+- Build and dialyzer clean on OTP 27, 28 and 29. Replaces the legacy
+  `catch Expr` operator (removed in OTP 29) with `try ... catch _:_ -> ok end`,
+  retypes `upgrade_from` as `gen_statem:from()`, and drops a handful of
+  unreachable clauses surfaced by `unmatched_returns`.
+
+### Tests / CI
+
+- Interop suite's `docker_run` now picks the last non-empty stdout line
+  as the container id so cold image pulls don't confuse it.
+- New GitHub Actions matrix runs build, xref, dialyze and tests on
+  OTP 27, 28 and 29 (rebar3 3.27.0).
+
 ## [0.2.2] - 2026-05-20
 
 ### Security
