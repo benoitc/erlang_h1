@@ -34,11 +34,11 @@ was already taken on hex.pm). The OTP application and module atom stay
 
 ```erlang
 %% rebar.config — from hex
-{deps, [{erlang_h1, "0.2.3"}]}.
+{deps, [{erlang_h1, "0.3.0"}]}.
 
 %% Or directly from git
 {deps, [
-    {erlang_h1, {git, "https://github.com/benoitc/erlang_h1.git", {tag, "0.2.3"}}}
+    {erlang_h1, {git, "https://github.com/benoitc/erlang_h1.git", {tag, "0.3.0"}}}
 ]}.
 ```
 

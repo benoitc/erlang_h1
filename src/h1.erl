@@ -77,6 +77,9 @@
     cert => binary() | string(),
     key => binary() | string(),
     cacerts => [binary()],
+    ssl_opts => [ssl:tls_option()],
+    ip => inet:ip_address(),
+    inet6 => boolean(),
     handler := fun((connection(), stream_id(), binary(), binary(), headers()) -> any())
               | module(),
     acceptors => pos_integer(),
@@ -192,7 +195,8 @@ start_server(Port, Opts) ->
 
 start_tcp(Port, Opts) ->
     TcpOpts = [binary, {active, false}, {packet, raw},
-               {reuseaddr, true}, {backlog, 1024}, {nodelay, true}],
+               {reuseaddr, true}, {backlog, 1024}, {nodelay, true}]
+              ++ socket_addr_opts(Opts),
     case gen_tcp:listen(Port, TcpOpts) of
         {ok, ListenSocket} ->
             {ok, {_, Bound}} = inet:sockname(ListenSocket),
@@ -209,7 +213,7 @@ start_ssl(Port, Opts) ->
                         {certfile, to_list(Cert)}, {keyfile, to_list(Key)},
                         {alpn_preferred_protocols, [<<"http/1.1">>]}],
             SslOpts = maps:get(ssl_opts, Opts, []),
-            Listen = merge(Defaults, SslOpts),
+            Listen = merge(Defaults ++ socket_addr_opts(Opts), SslOpts),
             case ssl:listen(Port, Listen) of
                 {ok, ListenSocket} ->
                     {ok, {_, Bound}} = ssl:sockname(ListenSocket),
@@ -384,6 +388,22 @@ pipeline(Conn, Enabled) when is_boolean(Enabled) ->
 %% ============================================================================
 %% Internal
 %% ============================================================================
+
+%% Build inet listen options from the `ip'/`inet6' server opts. An IPv6
+%% `ip' tuple (or `inet6 => true') selects the inet6 family; `ip' sets the
+%% bind address. Returned as a list suitable for gen_tcp/ssl listen opts.
+socket_addr_opts(Opts) ->
+    IP = maps:get(ip, Opts, undefined),
+    Family = case {IP, maps:get(inet6, Opts, false)} of
+        {{_, _, _, _, _, _, _, _}, _} -> [inet6];
+        {_, true} -> [inet6];
+        _ -> []
+    end,
+    Addr = case IP of
+        undefined -> [];
+        _ -> [{ip, IP}]
+    end,
+    Family ++ Addr.
 
 merge(Default, Override) ->
     Key = fun({K, _}) -> K; (K) -> K end,

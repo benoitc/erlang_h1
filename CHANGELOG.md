@@ -4,6 +4,15 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-06-02
+
+### Added
+
+- Listeners can bind a specific address or family. `start_server/2,3`
+  accept `ip => inet:ip_address()` (an 8-tuple selects IPv6) and
+  `inet6 => boolean()` (bind the IPv6 wildcard `::`) for both the `tcp`
+  and `ssl` transports.
+
 ## [0.2.3] - 2026-05-28
 
 ### Changed
