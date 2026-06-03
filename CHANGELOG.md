@@ -4,6 +4,14 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-06-04
+
+### Changed
+
+- Server `request` and `upgrade` events now deliver the full origin-form
+  target (path plus query) as `Path`; previously the query string was
+  dropped. Behavior change to the event's `Path`.
+
 ## [0.3.0] - 2026-06-02
 
 ### Added

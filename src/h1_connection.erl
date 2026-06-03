@@ -610,10 +610,11 @@ drive_parser({trailer, KV, P}, State, Mode) ->
 %% --- request / response arrival --------------------------------------------
 
 on_request(Method, URI, Version, P, State) ->
-    {Path, _Qs} = split_path(URI),
+    %% Keep the full origin-form request target (path plus any query) so the
+    %% query string reaches the owner via the request/upgrade events.
     Id = State#state.next_stream_id,
     Stream = #stream{id = Id, state = open, method = Method,
-                     path = Path, version = Version},
+                     path = URI, version = Version},
     State#state{parser = P,
                 next_stream_id = Id + 1,
                 current_stream = Id,
@@ -1363,12 +1364,6 @@ upsert(Name, Value, Headers) ->
 
 put_stream(#stream{id = Id} = S, State) ->
     State#state{streams = maps:put(Id, S, State#state.streams)}.
-
-split_path(URI) ->
-    case binary:split(URI, <<"?">>) of
-        [URI]  -> {URI, <<>>};
-        [P, Q] -> {P, Q}
-    end.
 
 handle_socket_closed(#state{} = State0, Reason) ->
     %% RFC 9112 §6.3 item 7: a close-delimited response body is bounded

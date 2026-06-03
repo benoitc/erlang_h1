@@ -16,6 +16,7 @@
 
 -export([
     simple_get/1,
+    request_carries_query_string/1,
     post_content_length/1,
     post_chunked/1,
     response_chunked/1,
@@ -44,8 +45,8 @@ all() ->
 
 groups() ->
     [{basic, [],
-      [simple_get, post_content_length, post_chunked, response_chunked,
-       response_with_trailers]},
+      [simple_get, request_carries_query_string, post_content_length,
+       post_chunked, response_chunked, response_with_trailers]},
      {keepalive, [],
       [keep_alive_two_requests, pipelined_two_requests,
        server_connection_close, client_closes_on_connection_close]},
@@ -99,6 +100,16 @@ simple_get(Config) ->
     {response, SId, 200, RespHeaders} = receive_h1(Client, 1000),
     ?assertEqual(<<"text/plain">>, proplists:get_value(<<"content-type">>, RespHeaders)),
     {data, SId, <<"hello">>, _} = receive_h1(Client, 1000),
+    stop_pair(Client, Server).
+
+%% The server must hand the owner the full origin-form target, query included
+%% (simple_get above covers the no-query case stays <<"/">>).
+request_carries_query_string(Config) ->
+    {Client, Server} = start_pair(Config),
+    {ok, _} = h1_connection:send_request(Client, <<"GET">>,
+                                         <<"/path?a=1&b=2">>,
+                                         [{<<"host">>, <<"x">>}], #{}),
+    {request, _, <<"GET">>, <<"/path?a=1&b=2">>, _} = receive_h1(Server, 1000),
     stop_pair(Client, Server).
 
 post_content_length(Config) ->
