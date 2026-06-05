@@ -15,6 +15,7 @@
     post_content_length/1,
     response_chunked/1,
     response_trailers/1,
+    respond_full/1,
     keep_alive/1,
     pipelined/1,
     get_tls/1,
@@ -23,7 +24,7 @@
 
 all() ->
     Base = [get_tcp, post_content_length, response_chunked, response_trailers,
-            keep_alive, pipelined, server_stop_is_clean],
+            respond_full, keep_alive, pipelined, server_stop_is_clean],
     case os:find_executable("openssl") of
         false -> Base;
         _ -> Base ++ [get_tls]
@@ -92,6 +93,13 @@ trailer_handler(Conn, StreamId, _M, _P, _H) ->
     ok = h1:send_data(Conn, StreamId, <<"body">>, false),
     ok = h1:send_trailers(Conn, StreamId, [{<<"x-checksum">>, <<"deadbeef">>}]).
 
+%% respond/5 sends status + headers + body in one write, adding
+%% Content-Length and ending the stream.
+respond_handler(Conn, StreamId, _M, _P, _H) ->
+    ok = h1:respond(Conn, StreamId, 200,
+                    [{<<"content-type">>, <<"application/json">>}],
+                    <<"{\"ok\":true}">>).
+
 %% ----------------------------------------------------------------------------
 %% Tests
 %% ----------------------------------------------------------------------------
@@ -143,6 +151,26 @@ response_trailers(Config0) ->
     ?assertEqual(200, Status),
     ?assertEqual(<<"body">>, Body),
     ?assertEqual(<<"deadbeef">>, proplists:get_value(<<"x-checksum">>, Trailers)),
+    h1:close(Conn).
+
+respond_full(Config0) ->
+    Config = start_tcp_server(fun respond_handler/5, Config0),
+    Port = h1:server_port(?config(server_ref, Config)),
+    {ok, Conn} = h1:connect("127.0.0.1", Port, #{transport => tcp}),
+    {ok, Id1} = h1:request(Conn, <<"GET">>, <<"/">>,
+                           [{<<"host">>, <<"localhost">>}]),
+    {Status, Hs, Body} = collect_response(Conn, Id1),
+    ?assertEqual(200, Status),
+    ?assertEqual(<<"{\"ok\":true}">>, Body),
+    %% Coalesced send frames the body with Content-Length, not chunked.
+    ?assertEqual(integer_to_binary(byte_size(Body)),
+                 proplists:get_value(<<"content-length">>, Hs)),
+    ?assertEqual(undefined, proplists:get_value(<<"transfer-encoding">>, Hs)),
+    %% The stream ended cleanly, so the keep-alive connection serves again.
+    {ok, Id2} = h1:request(Conn, <<"GET">>, <<"/again">>,
+                           [{<<"host">>, <<"localhost">>}]),
+    {200, _, Body2} = collect_response(Conn, Id2),
+    ?assertEqual(<<"{\"ok\":true}">>, Body2),
     h1:close(Conn).
 
 keep_alive(Config0) ->
