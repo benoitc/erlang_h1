@@ -30,7 +30,7 @@
 -export([activate/1]).
 -export([wait_connected/1, wait_connected/2]).
 -export([send_request/5, send_request_with_body/5]).
--export([send_response/4]).
+-export([send_response/4, respond/5]).
 -export([send_data/3, send_data/4]).
 -export([send_trailers/3]).
 -export([continue/2]).
@@ -171,6 +171,11 @@ send_request_with_body(Pid, Method, Path, Headers, Body) ->
 %% with end_stream=true.
 send_response(Pid, StreamId, Status, Headers) ->
     gen_statem:call(Pid, {send_response, StreamId, Status, Headers, #{}}).
+
+%% @doc Server: send a complete response (status, headers, body) in one
+%% socket write and end the stream.
+respond(Pid, StreamId, Status, Headers, Body) ->
+    gen_statem:call(Pid, {respond, StreamId, Status, Headers, Body}).
 
 send_data(Pid, StreamId, Data) ->
     send_data(Pid, StreamId, Data, false).
@@ -370,6 +375,12 @@ handle_event({call, From}, {send_response, StreamId, Status, Headers, _Opts}, op
              #state{mode = server} = State) ->
     handle_send_response(From, StreamId, Status, Headers, State);
 handle_event({call, From}, {send_response, _, _, _, _}, _, #state{mode = Mode}) ->
+    {keep_state_and_data, [{reply, From, {error, {bad_mode, Mode}}}]};
+
+handle_event({call, From}, {respond, StreamId, Status, Headers, Body}, open,
+             #state{mode = server} = State) ->
+    handle_respond(From, StreamId, Status, Headers, Body, State);
+handle_event({call, From}, {respond, _, _, _, _}, _, #state{mode = Mode}) ->
     {keep_state_and_data, [{reply, From, {error, {bad_mode, Mode}}}]};
 
 %% --- common: send_data / send_trailers / continue ---------------------------
@@ -1067,6 +1078,58 @@ handle_send_response(From, StreamId, Status, Headers, State0) ->
             end;
         error ->
             {keep_state_and_data, [{reply, From, {error, unknown_stream}}]}
+    end.
+
+%% Send status line, headers, and body in a single socket write, then end
+%% the stream. Coalesces what send_response/4 + send_data/4 would do as two
+%% writes, framing the body with Content-Length.
+handle_respond(From, StreamId, Status, Headers0, Body, State0) ->
+    {State, ResumeActions} = case State0#state.upgrade_pending of
+        true  -> {set_active_once(State0#state{upgrade_pending = false}), []};
+        false -> {State0, []}
+    end,
+    case maps:find(StreamId, State#state.streams) of
+        {ok, Stream} ->
+            Headers = ensure_content_length(Headers0, Body),
+            Framing = framing_of_response(Headers),
+            HeadersWire = augment_response_headers(Headers, Framing, State),
+            BodyWire = frame_body(Stream#stream{resp_framing = Framing}, Body, true),
+            Wire = [h1_message:status_line(Status, ?HTTP_1_1),
+                    h1_message:headers(HeadersWire),
+                    <<"\r\n">>,
+                    BodyWire],
+            case sock_send(State, Wire) of
+                ok ->
+                    Stream1 = Stream#stream{status = Status, resp_headers = Headers,
+                                            resp_framing = Framing,
+                                            state = half_closed_local},
+                    State1 = put_stream(Stream1, State),
+                    State2 = maybe_close_server_stream(StreamId, State1),
+                    case State2#state.close_after andalso State2#state.mode =:= server of
+                        true ->
+                            {stop_and_reply,
+                             {shutdown, goaway_sent},
+                             [{reply, From, ok} | ResumeActions],
+                             State2};
+                        false ->
+                            {keep_state, State2, [{reply, From, ok} | ResumeActions]}
+                    end;
+                {error, R} ->
+                    {keep_state_and_data, [{reply, From, {error, R}}]}
+            end;
+        error ->
+            {keep_state_and_data, [{reply, From, {error, unknown_stream}}]}
+    end.
+
+%% Add Content-Length for a fully-known body unless the caller already set
+%% a framing header.
+ensure_content_length(Headers, Body) ->
+    case {lookup_ci(<<"content-length">>, Headers),
+          lookup_ci(<<"transfer-encoding">>, Headers)} of
+        {undefined, undefined} ->
+            Headers ++ [{<<"content-length">>, integer_to_binary(iolist_size(Body))}];
+        _ ->
+            Headers
     end.
 
 augment_response_headers(Headers, chunked, State) ->

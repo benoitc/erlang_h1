@@ -35,7 +35,7 @@
 
 %% Server API
 -export([start_server/2, start_server/3, stop_server/1, server_port/1]).
--export([send_response/4]).
+-export([send_response/4, respond/5]).
 
 %% Common API
 -export([send_data/3, send_data/4]).
@@ -273,6 +273,16 @@ server_port({_, _, Port}) -> Port.
     ok | {error, term()}.
 send_response(Conn, StreamId, Status, Headers) ->
     h1_connection:send_response(Conn, StreamId, Status, Headers).
+
+-spec respond(connection(), stream_id(), status(), headers(), iodata()) ->
+    ok | {error, term()}.
+%% @doc Server: send a complete response (status, headers, and body) in a
+%% single socket write and end the stream. A Content-Length is added when
+%% the headers carry neither Content-Length nor Transfer-Encoding, so the
+%% body is sent fixed-length rather than chunked. Use this for fully-known
+%% bodies; use send_response/4 + send_data/4 for streaming.
+respond(Conn, StreamId, Status, Headers, Body) ->
+    h1_connection:respond(Conn, StreamId, Status, Headers, Body).
 
 %% ============================================================================
 %% Common
