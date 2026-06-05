@@ -68,6 +68,7 @@
     timeout => timeout(),
     pipeline => boolean(),
     max_keepalive_requests => pos_integer(),
+    max_header_block_size => pos_integer(),
     idle_timeout => timeout(),
     request_timeout => timeout()
 }.
@@ -86,7 +87,8 @@
     handshake_timeout => timeout(),
     idle_timeout => timeout(),
     request_timeout => timeout(),
-    max_keepalive_requests => pos_integer()
+    max_keepalive_requests => pos_integer(),
+    max_header_block_size => pos_integer()
 }.
 
 -export_type([connection/0, stream_id/0, headers/0, status/0, server_ref/0,
@@ -232,7 +234,7 @@ spawn_listener(Transport, ListenSocket, Bound, Opts) ->
                           max_keepalive_requests, pipeline,
                           max_line_length, max_empty_lines,
                           max_header_name_size, max_header_value_size,
-                          max_headers], Opts),
+                          max_headers, max_header_block_size], Opts),
     ServerOpts = maps:with([handshake_timeout], Opts),
     Ref = make_ref(),
     Args = #{transport => Transport,

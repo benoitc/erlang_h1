@@ -20,6 +20,7 @@
                       | invalid_header_value
                       | header_name_too_long
                       | header_value_too_long
+                      | header_block_too_large
                       | too_many_headers
                       | invalid_chunk_size
                       | chunk_size_too_long
@@ -55,6 +56,7 @@ classify(invalid_header_name)      -> parse_error;
 classify(invalid_header_value)     -> parse_error;
 classify(header_name_too_long)     -> parse_error;
 classify(header_value_too_long)    -> parse_error;
+classify(header_block_too_large)   -> parse_error;
 classify(too_many_headers)         -> parse_error;
 classify(invalid_chunk_size)       -> parse_error;
 classify(chunk_size_too_long)      -> parse_error;
@@ -86,6 +88,7 @@ status(invalid_header_name)      -> 400;
 status(invalid_header_value)     -> 400;
 status(header_name_too_long)     -> 431;
 status(header_value_too_long)    -> 431;
+status(header_block_too_large)   -> 431;
 status(too_many_headers)         -> 431;
 status(invalid_chunk_size)       -> 400;
 status(chunk_size_too_long)      -> 400;
@@ -112,6 +115,7 @@ format(invalid_header_name)      -> "Header name contains invalid characters";
 format(invalid_header_value)     -> "Header value contains invalid characters";
 format(header_name_too_long)     -> "Header name exceeds configured limit";
 format(header_value_too_long)    -> "Header value exceeds configured limit";
+format(header_block_too_large)   -> "Header block exceeds configured limit";
 format(too_many_headers)         -> "Message contains too many headers";
 format(invalid_chunk_size)       -> "Chunk size is not valid hex";
 format(chunk_size_too_long)      -> "Chunk size line exceeds 16 characters";

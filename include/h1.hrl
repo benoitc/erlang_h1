@@ -17,6 +17,7 @@
 -define(H1_MAX_CHUNK_SIZE,        1048576).   %% 1 MB
 -define(H1_MAX_BODY_SIZE,         8388608).   %% 8 MB
 -define(H1_MAX_LINE_LENGTH,       16384).     %% hackney default
+-define(H1_MAX_HEADER_BLOCK_SIZE, 65536).     %% total header-block bytes (DoS guard)
 -define(H1_MAX_EMPTY_LINES,       10).
 -define(H1_MAX_CHUNK_SIZE_HEX,    16).         %% 64-bit max, way past any legit chunk
 -define(H1_MAX_CHUNK_EXT_SIZE,    4096).       %% cap chunk-extension scan (DoS guard)
@@ -72,9 +73,12 @@
     max_header_value_size = ?H1_MAX_HEADER_VALUE_SIZE :: pos_integer(),
     max_headers      = ?H1_MAX_HEADERS       :: pos_integer(),
     max_body_size    = ?H1_MAX_BODY_SIZE     :: pos_integer() | infinity,
+    max_header_block_size = ?H1_MAX_HEADER_BLOCK_SIZE :: pos_integer(),
     %% Counters
     empty_lines      = 0       :: non_neg_integer(),
-    header_count     = 0       :: non_neg_integer()
+    header_count     = 0       :: non_neg_integer(),
+    %% Total bytes consumed in the current header (or trailer) block.
+    header_bytes     = 0       :: non_neg_integer()
 }).
 
 -endif.

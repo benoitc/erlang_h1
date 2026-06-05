@@ -77,6 +77,8 @@
     oversized_uri/1,
     oversized_method/1,
     oversized_header_value/1,
+    header_block_too_large/1,
+    header_block_partial_line_capped/1,
     max_body_size_identity/1,
     max_body_size_chunked/1
 ]).
@@ -123,7 +125,8 @@ groups() ->
        honor_connection_close]},
      {dos, [],
       [too_many_headers, oversized_uri, oversized_method,
-       oversized_header_value, max_body_size_identity,
+       oversized_header_value, header_block_too_large,
+       header_block_partial_line_capped, max_body_size_identity,
        max_body_size_chunked]}].
 
 %% ============================================================================
@@ -469,6 +472,24 @@ oversized_header_value(_Config) ->
     Bin = iolist_to_binary([<<"GET / HTTP/1.1\r\nHost: a\r\nX-Big: ">>,
                             Big, <<"\r\n\r\n">>]),
     ?assertMatch({error, _}, h1_parse:parse_request(Bin)).
+
+header_block_too_large(_Config) ->
+    %% 50 headers, each within the per-field and count limits, that together
+    %% exceed a small block budget. The block cap must reject them.
+    HdrBins = [<<"X-Pad-", (integer_to_binary(N))/binary,
+                 ": some-value-padding-1234567890\r\n">>
+               || N <- lists:seq(1, 50)],
+    Bin = iolist_to_binary([<<"GET / HTTP/1.1\r\n">>, HdrBins, <<"\r\n">>]),
+    ?assertEqual({error, header_block_too_large},
+                 h1_parse:parse_request(Bin, #{max_header_block_size => 1024})).
+
+header_block_partial_line_capped(_Config) ->
+    %% A header line that never terminates must not grow the buffer past
+    %% the block budget.
+    P = h1_parse:parser([request, {max_header_block_size, 1024}]),
+    {request, _, _, _, P1} = h1_parse:execute(P, <<"GET / HTTP/1.1\r\n">>),
+    ?assertEqual({error, header_block_too_large},
+                 h1_parse:execute(P1, binary:copy(<<"x">>, 2048))).
 
 max_body_size_identity(_Config) ->
     Bin = <<"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n",
