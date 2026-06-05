@@ -62,6 +62,7 @@
                        | {max_header_name_size, pos_integer()}
                        | {max_header_value_size, pos_integer()}
                        | {max_headers, pos_integer()}
+                       | {max_header_block_size, pos_integer()}
                        | {max_body_size, pos_integer() | infinity}
                        | {method, binary()}
                        | {status, 100..599}.
@@ -113,6 +114,8 @@ apply_options([{max_header_value_size, N} | R], St) when is_integer(N), N > 0 ->
     apply_options(R, St#h1_parser{max_header_value_size = N});
 apply_options([{max_headers, N} | R], St) when is_integer(N), N > 0 ->
     apply_options(R, St#h1_parser{max_headers = N});
+apply_options([{max_header_block_size, N} | R], St) when is_integer(N), N > 0 ->
+    apply_options(R, St#h1_parser{max_header_block_size = N});
 apply_options([{method, M} | R], St) when is_binary(M) ->
     apply_options(R, St#h1_parser{method = M});
 apply_options([{status, S} | R], St)
@@ -323,6 +326,13 @@ parse_header_step(#h1_parser{header_count = N, max_headers = Max})
 parse_header_step(#h1_parser{} = St) ->
     parse_header_line(St).
 
+%% Bound the whole header (or trailer) block so a peer can't grow the
+%% buffer without end, whether by dribbling a line that never terminates
+%% or by stacking headers that stay under the per-field and count limits.
+parse_header_line(#h1_parser{buffer = B, header_bytes = HB,
+                             max_header_block_size = Max})
+    when HB + byte_size(B) > Max ->
+    {error, header_block_too_large};
 %% Find the end of one header line with a single scan for LF (accepting
 %% either CRLF or a bare LF), instead of a probe split followed by a
 %% consume split. The line and remainder are reference slices, not copies.
@@ -332,8 +342,9 @@ parse_header_line(#h1_parser{buffer = B} = St) ->
             {more, St};
         {Pos, 1} ->
             RestLen = byte_size(B) - (Pos + 1),
+            St1 = St#h1_parser{header_bytes = St#h1_parser.header_bytes + Pos + 1},
             dispatch_header_line(line_before_lf(B, Pos),
-                                 binary:part(B, Pos + 1, RestLen), St)
+                                 binary:part(B, Pos + 1, RestLen), St1)
     end.
 
 %% Bytes before the LF, dropping a trailing CR when the line ended in CRLF.
@@ -636,7 +647,8 @@ transfer_decode(Data, #h1_parser{
             parse_trailer_step(St#h1_parser{buffer = Rest,
                                             state = on_trailers,
                                             body_state = done,
-                                            header_count = 0});
+                                            header_count = 0,
+                                            header_bytes = 0});
         more ->
             {more, St#h1_parser{buffer = Data}, Buf};
         {more, TS2} ->

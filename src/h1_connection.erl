@@ -304,7 +304,8 @@ parser_base_opts(Type, Opts) ->
     [Type
      | [{K, V}
         || K <- [max_line_length, max_empty_lines, max_header_name_size,
-                 max_header_value_size, max_headers, max_body_size],
+                 max_header_value_size, max_headers, max_header_block_size,
+                 max_body_size],
            V <- [maps:get(K, Opts, undefined)],
            V =/= undefined]].
 
