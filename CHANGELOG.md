@@ -4,6 +4,28 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-06-05
+
+### Added
+
+- `max_header_block_size` bounds the total bytes of a message's header
+  block (default 64 KB), configurable on `start_server`/`connect`. It
+  covers request and response headers and trailers. Over-limit input is
+  rejected with `header_block_too_large`, which maps to HTTP 431.
+
+### Changed
+
+- Less per-request work on the hot paths: the body is measured without
+  being copied, each header line is parsed in a single scan, and the
+  response header block is built in one pass. No behaviour change.
+
+### Security
+
+- Close an unbounded-buffer path in header parsing. A peer could otherwise
+  grow the parse buffer without end by dribbling a header line that never
+  terminates, or by stacking headers that each stayed under the per-field
+  size and header-count limits. The new header-block cap bounds it.
+
 ## [0.5.0] - 2026-06-05
 
 ### Added
