@@ -321,69 +321,73 @@ parse_header_step(#h1_parser{header_count = N, max_headers = Max})
     when N >= Max ->
     {error, too_many_headers};
 parse_header_step(#h1_parser{} = St) ->
-    parse_header_sep([<<"\r\n">>, <<"\n">>], St).
+    parse_header_line(St).
 
-parse_header_sep([], St) ->
-    {more, St};
-parse_header_sep([Sep | Rest], #h1_parser{buffer = B} = St) ->
-    case binary:split(B, Sep) of
-        [_, _] -> parse_header_line(Sep, St);
-        [B]    -> parse_header_sep(Rest, St)
+%% Find the end of one header line with a single scan for LF (accepting
+%% either CRLF or a bare LF), instead of a probe split followed by a
+%% consume split. The line and remainder are reference slices, not copies.
+parse_header_line(#h1_parser{buffer = B} = St) ->
+    case binary:match(B, <<"\n">>) of
+        nomatch ->
+            {more, St};
+        {Pos, 1} ->
+            RestLen = byte_size(B) - (Pos + 1),
+            dispatch_header_line(line_before_lf(B, Pos),
+                                 binary:part(B, Pos + 1, RestLen), St)
     end.
 
-parse_header_line(Sep, #h1_parser{buffer = B} = St) ->
-    case binary:split(B, Sep) of
-        [<<>>, Rest] ->
-            %% End of headers — enforce RFC 9112 §6.1 (CL + TE).
-            case finalize_headers(St#h1_parser{buffer = Rest,
-                                               state = on_body}) of
-                {ok, St1} -> {headers_complete, St1};
-                {error, _} = E -> E
-            end;
-        [Line, <<$\s, Tail/binary>>] ->
-            obs_fold(Sep, Line, Tail, St);
-        [Line, <<$\t, Tail/binary>>] ->
-            obs_fold(Sep, Line, Tail, St);
-        [Line, Rest] ->
-            case split_header(Line) of
-                {ok, Key0, Value} ->
-                    ValidName = valid_header_name(Key0),
-                    case {ValidName, byte_size(Key0), byte_size(Value)} of
-                        {true, KN, _} when KN > (St#h1_parser.max_header_name_size) ->
-                            {error, header_name_too_long};
-                        {true, _, VN} when VN > (St#h1_parser.max_header_value_size) ->
-                            {error, header_value_too_long};
-                        {true, _, _} ->
-                            %% Normalize to lowercase so callers can do
-                            %% simple proplists lookups and the event
-                            %% shape matches h2 (which requires lowercase
-                            %% header names on the wire).
-                            Key = to_lower(Key0),
-                            St1 = absorb_header(Key, Value,
-                                                St#h1_parser{buffer = Rest,
-                                                             header_count =
-                                                                 St#h1_parser.header_count + 1}),
-                            {header, {Key, Value}, St1};
-                        {false, _, _} ->
-                            {error, invalid_header_name}
-                    end;
-                {error, R} ->
-                    {error, R}
-            end;
-        [B] ->
-            {more, St}
+%% Bytes before the LF, dropping a trailing CR when the line ended in CRLF.
+line_before_lf(B, Pos) ->
+    case Pos > 0 andalso binary:at(B, Pos - 1) =:= $\r of
+        true  -> binary:part(B, 0, Pos - 1);
+        false -> binary:part(B, 0, Pos)
     end.
 
-%% RFC 9112 §5.3: accept obs-fold by rewriting to a single space, but
-%% re-check that the folded header doesn't sneak past max_header_value_size.
-obs_fold(Sep, Line, Tail, St) ->
+%% End of headers — enforce RFC 9112 §6.1 (CL + TE).
+dispatch_header_line(<<>>, Rest, St) ->
+    case finalize_headers(St#h1_parser{buffer = Rest, state = on_body}) of
+        {ok, St1} -> {headers_complete, St1};
+        {error, _} = E -> E
+    end;
+dispatch_header_line(Line, <<$\s, _/binary>> = Rest, St) ->
+    obs_fold(Line, Rest, St);
+dispatch_header_line(Line, <<$\t, _/binary>> = Rest, St) ->
+    obs_fold(Line, Rest, St);
+dispatch_header_line(Line, Rest, St) ->
+    case split_header(Line) of
+        {ok, Key0, Value} ->
+            ValidName = valid_header_name(Key0),
+            case {ValidName, byte_size(Key0), byte_size(Value)} of
+                {true, KN, _} when KN > (St#h1_parser.max_header_name_size) ->
+                    {error, header_name_too_long};
+                {true, _, VN} when VN > (St#h1_parser.max_header_value_size) ->
+                    {error, header_value_too_long};
+                {true, _, _} ->
+                    %% Normalize to lowercase so callers can do simple
+                    %% proplists lookups and the event shape matches h2
+                    %% (which requires lowercase header names on the wire).
+                    Key = to_lower(Key0),
+                    St1 = absorb_header(Key, Value,
+                                        St#h1_parser{buffer = Rest,
+                                                     header_count =
+                                                         St#h1_parser.header_count + 1}),
+                    {header, {Key, Value}, St1};
+                {false, _, _} ->
+                    {error, invalid_header_name}
+            end;
+        {error, R} ->
+            {error, R}
+    end.
+
+%% RFC 9112 §5.3: accept obs-fold by rewriting the leading whitespace to a
+%% single space, re-checking the folded value against max_header_value_size.
+obs_fold(Line, Rest, St) ->
     Max = St#h1_parser.max_header_value_size,
+    Tail = binary:part(Rest, 1, byte_size(Rest) - 1),
     Folded = iolist_to_binary([Line, $\s, Tail]),
-    %% Upper bound: a single header value can't exceed the full folded
-    %% first line length minus `Name:' minimum overhead. Cheap guard.
     case byte_size(Folded) > Max + St#h1_parser.max_header_name_size + 2 of
         true  -> {error, header_value_too_long};
-        false -> parse_header_line(Sep, St#h1_parser{buffer = Folded})
+        false -> parse_header_line(St#h1_parser{buffer = Folded})
     end.
 
 split_header(Line) ->
@@ -777,8 +781,7 @@ parse_trailer_step(#h1_parser{buffer = B} = St) ->
         more ->
             {more, St#h1_parser{state = on_trailers}, <<>>};
         no ->
-            case parse_header_sep([<<"\r\n">>, <<"\n">>],
-                                  St#h1_parser{state = on_trailers}) of
+            case parse_header_line(St#h1_parser{state = on_trailers}) of
                 {headers_complete, St1} ->
                     {done, St1#h1_parser.buffer};
                 {header, {K, V}, St1} ->
