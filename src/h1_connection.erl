@@ -1052,8 +1052,7 @@ handle_send_response(From, StreamId, Status, Headers, State0) ->
     end,
     case maps:find(StreamId, State#state.streams) of
         {ok, Stream} ->
-            Framing = framing_of_response(Headers),
-            HeadersWire = augment_response_headers(Headers, Framing, State),
+            {Framing, HeadersWire} = prepare_response(Headers, no_body, State),
             Stream1 = Stream#stream{status = Status, resp_headers = Headers,
                                     resp_framing = Framing, state = open},
             Wire = [h1_message:status_line(Status, ?HTTP_1_1),
@@ -1080,9 +1079,7 @@ handle_respond(From, StreamId, Status, Headers0, Body, State0) ->
     end,
     case maps:find(StreamId, State#state.streams) of
         {ok, Stream} ->
-            Headers = ensure_content_length(Headers0, Body),
-            Framing = framing_of_response(Headers),
-            HeadersWire = augment_response_headers(Headers, Framing, State),
+            {Framing, HeadersWire} = prepare_response(Headers0, Body, State),
             BodyWire = frame_body(Stream#stream{resp_framing = Framing}, Body, true),
             Wire = [h1_message:status_line(Status, ?HTTP_1_1),
                     h1_message:headers(HeadersWire),
@@ -1090,7 +1087,7 @@ handle_respond(From, StreamId, Status, Headers0, Body, State0) ->
                     BodyWire],
             case sock_send(State, Wire) of
                 ok ->
-                    Stream1 = Stream#stream{status = Status, resp_headers = Headers,
+                    Stream1 = Stream#stream{status = Status, resp_headers = Headers0,
                                             resp_framing = Framing,
                                             state = half_closed_local},
                     State1 = put_stream(Stream1, State),
@@ -1111,33 +1108,63 @@ handle_respond(From, StreamId, Status, Headers0, Body, State0) ->
             {keep_state_and_data, [{reply, From, {error, unknown_stream}}]}
     end.
 
-%% Add Content-Length for a fully-known body unless the caller already set
-%% a framing header.
-ensure_content_length(Headers, Body) ->
-    case {lookup_ci(<<"content-length">>, Headers),
-          lookup_ci(<<"transfer-encoding">>, Headers)} of
-        {undefined, undefined} ->
-            Headers ++ [{<<"content-length">>, integer_to_binary(iolist_size(Body))}];
+%% Decide framing and build the response header block in a single pass over
+%% the caller's headers, instead of rescanning (and re-lowercasing every
+%% name) once per decision. `Body' is `no_body' for a header-only send, or
+%% the body iodata for a coalesced respond (used to add Content-Length when
+%% the caller set no framing header).
+prepare_response(Headers, Body, #state{close_after = CloseAfter}) ->
+    {CL0, TE, HasConn} = scan_response_headers(Headers),
+    {Headers1, CL} = case {CL0, TE, Body} of
+        {undefined, undefined, B} when B =/= no_body ->
+            CLBin = integer_to_binary(iolist_size(B)),
+            {Headers ++ [{<<"content-length">>, CLBin}], CLBin};
         _ ->
-            Headers
-    end.
-
-augment_response_headers(Headers, chunked, State) ->
-    H1 = case lookup_ci(<<"transfer-encoding">>, Headers) of
-        undefined ->
-            Headers ++ [{<<"transfer-encoding">>, <<"chunked">>}];
-        TE ->
-            case has_token(h1_parse_erl:to_lower(TE), <<"chunked">>) of
-                true  -> Headers;
-                %% We frame the body as chunked, so the advertised
-                %% Transfer-Encoding must end with `chunked' (RFC 9112
-                %% §6.1) or the peer will mis-frame the response.
-                false -> append_chunked_te(Headers)
+            {Headers, CL0}
+    end,
+    Framing = case CL of
+        undefined -> chunked;
+        _ ->
+            case h1_parse_erl:to_int(iolist_to_binary(CL)) of
+                {ok, N} -> {content_length, N};
+                false   -> {content_length, 0}
             end
     end,
-    ensure_close_header(H1, State);
-augment_response_headers(Headers, _, State) ->
-    ensure_close_header(Headers, State).
+    {Framing, augment(Framing, TE, HasConn, CloseAfter, Headers1)}.
+
+%% First occurrence of each framing-relevant header (case-insensitive,
+%% matching lookup_ci/2), collected in one traversal.
+scan_response_headers(Headers) ->
+    scan_response_headers(Headers, undefined, undefined, false).
+
+scan_response_headers([], CL, TE, HasConn) ->
+    {CL, TE, HasConn};
+scan_response_headers([{N, V} | Rest], CL, TE, HasConn) ->
+    case h1_parse_erl:to_lower(N) of
+        <<"content-length">>    -> scan_response_headers(Rest, first(CL, V), TE, HasConn);
+        <<"transfer-encoding">> -> scan_response_headers(Rest, CL, first(TE, V), HasConn);
+        <<"connection">>        -> scan_response_headers(Rest, CL, TE, true);
+        _                       -> scan_response_headers(Rest, CL, TE, HasConn)
+    end.
+
+first(undefined, V) -> V;
+first(Existing, _)  -> Existing.
+
+%% Add Transfer-Encoding: chunked / Connection: close as needed, reusing the
+%% header presence already discovered by scan_response_headers/1.
+augment(chunked, undefined, HasConn, CloseAfter, Headers) ->
+    ensure_close(Headers ++ [{<<"transfer-encoding">>, <<"chunked">>}],
+                 HasConn, CloseAfter);
+augment(chunked, TE, HasConn, CloseAfter, Headers) ->
+    H1 = case has_token(h1_parse_erl:to_lower(iolist_to_binary(TE)), <<"chunked">>) of
+        true  -> Headers;
+        %% We frame the body as chunked, so the advertised Transfer-Encoding
+        %% must end with `chunked' (RFC 9112 §6.1) or the peer mis-frames it.
+        false -> append_chunked_te(Headers)
+    end,
+    ensure_close(H1, HasConn, CloseAfter);
+augment(_Framing, _TE, HasConn, CloseAfter, Headers) ->
+    ensure_close(Headers, HasConn, CloseAfter).
 
 append_chunked_te(Headers) ->
     [case h1_parse_erl:to_lower(N) of
@@ -1145,28 +1172,9 @@ append_chunked_te(Headers) ->
          _ -> {N, V}
      end || {N, V} <- Headers].
 
-framing_of_response(Headers) ->
-    case {lookup_ci(<<"content-length">>, Headers),
-          lookup_ci(<<"transfer-encoding">>, Headers)} of
-        {undefined, undefined} -> chunked;
-        {undefined, TE} ->
-            case has_token(h1_parse_erl:to_lower(TE), <<"chunked">>) of
-                true -> chunked;
-                false -> chunked   %% degrade: if TE present but not chunked, still chunked
-            end;
-        {CL, _} ->
-            case h1_parse_erl:to_int(CL) of
-                {ok, N} -> {content_length, N};
-                false -> {content_length, 0}
-            end
-    end.
-
-ensure_close_header(Headers, #state{close_after = true}) ->
-    case lookup_ci(<<"connection">>, Headers) of
-        undefined -> Headers ++ [{<<"connection">>, <<"close">>}];
-        _ -> Headers
-    end;
-ensure_close_header(Headers, _State) ->
+ensure_close(Headers, false, true) ->
+    Headers ++ [{<<"connection">>, <<"close">>}];
+ensure_close(Headers, _HasConn, _CloseAfter) ->
     Headers.
 
 handle_send_data(From, StreamId, Data, EndStream, State) ->
