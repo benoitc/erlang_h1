@@ -591,8 +591,12 @@ drive_parser({request, Method, URI, Version, P}, State, server) ->
 drive_parser({response, Version, Status, _Reason, P}, State, client) ->
     State1 = on_response(Version, Status, P, State),
     drive_parser(h1_parse_erl:execute(P), State1, client);
-drive_parser({header, KV, P}, State, _Mode) ->
-    drive_parser(h1_parse_erl:execute(P), accumulate_header(KV, State), _Mode);
+drive_parser({header, _KV, P}, State, Mode) ->
+    %% The parser already accumulates every header in `partial_headers';
+    %% it's read out once at headers_complete. Storing it again per header
+    %% in the stream record (a record copy + map put each time) was pure
+    %% duplication, so just keep draining the parser.
+    drive_parser(h1_parse_erl:execute(P), State, Mode);
 drive_parser({headers_complete, P}, State, Mode) ->
     State1 = State#state{parser = P},
     case on_headers_complete(State1, Mode) of
@@ -645,21 +649,6 @@ on_response(Version, Status, P, State) ->
                 current_stream = Id,
                 streams = maps:put(Id, Stream, State#state.streams)}.
 
-accumulate_header({Name, Value}, #state{current_stream = Id} = State)
-    when Id =/= undefined ->
-    case maps:find(Id, State#state.streams) of
-        {ok, Stream} ->
-            case State#state.mode of
-                server ->
-                    NStream = Stream#stream{req_headers = [{Name, Value} | Stream#stream.req_headers]},
-                    put_stream(NStream, State);
-                client ->
-                    NStream = Stream#stream{resp_headers = [{Name, Value} | Stream#stream.resp_headers]},
-                    put_stream(NStream, State)
-            end;
-        error -> State
-    end.
-
 accumulate_trailer({Name, Value}, #state{current_stream = Id} = State)
     when Id =/= undefined ->
     case maps:find(Id, State#state.streams) of
@@ -673,7 +662,7 @@ accumulate_trailer({Name, Value}, #state{current_stream = Id} = State)
 %% to set up body framing and emits the appropriate event.
 on_headers_complete(#state{mode = server, current_stream = Id} = State, server) ->
     Stream0 = maps:get(Id, State#state.streams),
-    Headers = lists:reverse(Stream0#stream.req_headers),
+    Headers = h1_parse_erl:get(State#state.parser, headers),
     Stream1 = Stream0#stream{req_headers = Headers},
     %% RFC 9110 §7.2: HTTP/1.1 requests MUST include a Host header.
     case missing_host_on_http_1_1(Stream1, Headers) of
@@ -685,7 +674,7 @@ on_headers_complete(#state{mode = server, current_stream = Id} = State, server) 
     end;
 on_headers_complete(#state{mode = client, current_stream = Id} = State, client) ->
     Stream0 = maps:get(Id, State#state.streams),
-    Headers = lists:reverse(Stream0#stream.resp_headers),
+    Headers = h1_parse_erl:get(State#state.parser, headers),
     Stream1 = Stream0#stream{resp_headers = Headers},
     Status = Stream1#stream.status,
     case Status of
@@ -777,8 +766,9 @@ detect_upgrade_from_headers(Headers) ->
             end
     end.
 
-lookup_ci(Needle, Headers) ->
-    Lower = h1_parse_erl:to_lower(Needle),
+%% Needle is always a lowercase literal at the call sites, so compare
+%% against it directly instead of lowercasing it again on every lookup.
+lookup_ci(Lower, Headers) ->
     case lists:search(
            fun({N, _V}) -> h1_parse_erl:to_lower(N) =:= Lower end,
            Headers) of
