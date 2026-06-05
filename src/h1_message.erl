@@ -201,9 +201,10 @@ encode(Head, Headers, Body) ->
 
 -spec encode(iodata(), headers(), iodata(), map()) -> iodata().
 encode(Head, Headers, Body, _Opts) ->
-    BodyBin = iolist_to_binary(Body),
-    Headers1 = ensure_content_length(Headers, BodyBin),
-    [Head, headers(Headers1), <<"\r\n">>, BodyBin].
+    %% Keep the body as iodata; gen_tcp/ssl:send takes iodata directly, so
+    %% there's no need to flatten it just to emit the message.
+    Headers1 = ensure_content_length(Headers, Body),
+    [Head, headers(Headers1), <<"\r\n">>, Body].
 
 %% ----------------------------------------------------------------------------
 %% Chunked streaming
@@ -255,8 +256,10 @@ choose_framing(chunked, Headers) ->
          end,
     {chunked, H2};
 choose_framing(Body, Headers) ->
-    Bin = iolist_to_binary(Body),
-    Size = byte_size(Bin),
+    %% Measure the body without flattening it: the caller frames the
+    %% original iodata on the wire, so building a throwaway binary here
+    %% was a full copy of the request/response body for nothing.
+    Size = iolist_size(Body),
     H1 = drop_header(<<"transfer-encoding">>, Headers),
     H2 = case has_header(<<"content-length">>, H1) of
              true -> H1;
@@ -268,7 +271,7 @@ ensure_content_length(Headers, Body) ->
     case has_header(<<"content-length">>, Headers)
       orelse has_header(<<"transfer-encoding">>, Headers) of
         true -> Headers;
-        false -> Headers ++ [{<<"content-length">>, integer_to_binary(byte_size(Body))}]
+        false -> Headers ++ [{<<"content-length">>, integer_to_binary(iolist_size(Body))}]
     end.
 
 has_header(Needle, Headers) ->
