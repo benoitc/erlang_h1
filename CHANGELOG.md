@@ -4,6 +4,16 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-06-05
+
+### Added
+
+- `h1:respond/5` sends status, headers, and body in a single socket write
+  and ends the stream. A `Content-Length` is added when the headers carry
+  neither `Content-Length` nor `Transfer-Encoding`, so a fully-known body
+  is sent fixed-length in one `gen_tcp:send` rather than the two writes
+  `send_response/4` + `send_data/4` would do.
+
 ## [0.4.0] - 2026-06-04
 
 ### Changed
