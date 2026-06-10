@@ -28,7 +28,7 @@
 - **Host auto-add (client):** if the caller didn't include a `host:` header, the client adds one from the hostname passed to `h1:connect/*`. HTTP/1.1 requests reaching the server without a `Host` header are answered with 400 and the connection is closed — RFC 9110 §7.2 requires exactly one `Host`.
 - Keep-alive (RFC 9112 §9.3): HTTP/1.1 default is reuse; `Connection: close` from either side flips the connection to `close_after = true` and shuts after the current exchange drains.
 - **Request pipelining** (client): multiple `h1:request/4,5` calls may be in flight simultaneously; responses are attached to requests in the order they were sent. Each request gets a monotonic `StreamId` so the event shape matches h2.
-- **Pipelined response ordering** (server): `h1_server:connection_loop/2` only pulls the next `{request, ...}` event from the mailbox after the current handler process exits, so response bytes for request N are fully flushed before any bytes for request N+1 hit the socket.
+- **Pipelined response ordering** (server): the `h1_server` connection loop only pulls the next `{request, ...}` event from the mailbox after the current handler process exits, so response bytes for request N are fully flushed before any bytes for request N+1 hit the socket.
 - `Expect: 100-continue` (RFC 9110 §10.1.1):
   - Server surfaces it as a stream flag; the handler calls `h1:continue/2` to send `100 Continue` or ignores it and sends the final response directly.
   - Client sets the header automatically when the caller supplies a body, stages the body, and releases it on receiving `100 Continue` or a non-100 response.
