@@ -16,12 +16,14 @@
     upgrade_capsule_exchange/1,
     upgrade_with_leftover_bytes/1,
     upgrade_with_path_pseudo_header/1,
-    upgrade_wire_path_in_request_line/1
+    upgrade_wire_path_in_request_line/1,
+    accept_upgrade_dedupes_framing_headers/1
 ]).
 
 all() ->
     [upgrade_handshake, upgrade_capsule_exchange, upgrade_with_leftover_bytes,
-     upgrade_with_path_pseudo_header, upgrade_wire_path_in_request_line].
+     upgrade_with_path_pseudo_header, upgrade_wire_path_in_request_line,
+     accept_upgrade_dedupes_framing_headers].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(h1),
@@ -191,6 +193,45 @@ upgrade_wire_path_in_request_line(_Config) ->
     ?assert(binary:match(Lower, <<"connection: upgrade">>) =/= nomatch),
     %% :path must NOT appear as a header line.
     ?assertEqual(nomatch, binary:match(Bytes, <<":path">>)),
+    ok.
+
+%% Regression: accept_upgrade/3 prepended its framing headers without
+%% checking ExtraHeaders, so a caller passing connection/upgrade (any
+%% case) produced a 101 with each header twice. Spec-strict WebSocket
+%% clients (Safari, undici) reject the handshake on the duplicates.
+%% Raw client socket so we can count the exact header lines written.
+accept_upgrade_dedupes_framing_headers(Config0) ->
+    Handler = fun(Conn, StreamId, _M, _P, _Hs) ->
+        {ok, Sock, _Buf} = h1:accept_upgrade(Conn, StreamId,
+            [{<<"Connection">>, <<"Upgrade">>},
+             {<<"UPGRADE">>, <<"websocket">>},
+             {<<"sec-websocket-accept">>, <<"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=">>}]),
+        receive go_close -> gen_tcp:close(Sock) after 2000 -> ok end
+    end,
+    Config = start_server(Handler, Config0),
+    Port = h1:server_port(?config(server_ref, Config)),
+    {ok, Sock} = gen_tcp:connect("127.0.0.1", Port,
+                                 [binary, {active, false}, {packet, raw}]),
+    ok = gen_tcp:send(Sock,
+        <<"GET /chat HTTP/1.1\r\n"
+          "host: localhost\r\n"
+          "connection: Upgrade\r\n"
+          "upgrade: websocket\r\n\r\n">>),
+    Bytes = recv_until_headers(Sock),
+    [Head | _] = binary:split(Bytes, <<"\r\n\r\n">>),
+    [StatusLine | HeaderLines] = binary:split(Head, <<"\r\n">>, [global]),
+    ?assertMatch(<<"HTTP/1.1 101 ", _/binary>>, StatusLine),
+    Headers = [begin
+                   [N, V] = binary:split(L, <<":">>),
+                   {string:lowercase(N), string:trim(V)}
+               end || L <- HeaderLines],
+    ?assertEqual([<<"Upgrade">>],
+                 [V || {<<"connection">>, V} <- Headers]),
+    ?assertEqual([<<"websocket">>],
+                 [V || {<<"upgrade">>, V} <- Headers]),
+    ?assertEqual([<<"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=">>],
+                 [V || {<<"sec-websocket-accept">>, V} <- Headers]),
+    gen_tcp:close(Sock),
     ok.
 
 recv_until_headers(Sock) ->

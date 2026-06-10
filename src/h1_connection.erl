@@ -1345,9 +1345,16 @@ handle_accept_upgrade(From, StreamId, ExtraHeaders, State) ->
                     {keep_state_and_data,
                      [{reply, From, {error, no_upgrade_header}}]};
                 _ ->
+                    %% h1 owns the framing headers: drop any caller-supplied
+                    %% connection/upgrade so the 101 carries exactly one of
+                    %% each (duplicates break spec-strict WebSocket clients).
+                    Extra = [H || {N, _} = H <- ExtraHeaders,
+                                  not lists:member(
+                                        h1_parse_erl:to_lower(N),
+                                        [<<"connection">>, <<"upgrade">>])],
                     Hdrs = [{<<"connection">>, <<"Upgrade">>},
                             {<<"upgrade">>, Proto}
-                            | ExtraHeaders],
+                            | Extra],
                     Wire = [h1_message:status_line(101, ?HTTP_1_1),
                             h1_message:headers(Hdrs),
                             <<"\r\n">>],

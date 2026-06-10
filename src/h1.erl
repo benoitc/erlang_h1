@@ -366,7 +366,12 @@ upgrade(Conn, Protocol, Headers) ->
 upgrade(Conn, Protocol, Headers, Timeout) ->
     h1_connection:upgrade(Conn, Protocol, Headers, Timeout).
 
-%% @doc Server: reply 101 Switching Protocols to an upgrade request.
+%% @doc Server: reply 101 Switching Protocols to an upgrade request
+%% and take ownership of the raw socket. Injects the `Connection:
+%% Upgrade' and `Upgrade: <proto>' framing headers itself and strips
+%% any caller-supplied copies (case-insensitive), so the 101 carries
+%% exactly one of each. Pass only protocol-specific extras in
+%% ExtraHeaders (e.g. `sec-websocket-accept').
 -spec accept_upgrade(connection(), stream_id(), headers()) ->
     {ok, term(), binary()} | {error, term()}.
 accept_upgrade(Conn, StreamId, ExtraHeaders) ->
