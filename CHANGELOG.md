@@ -4,6 +4,16 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] - 2026-06-10
+
+### Fixed
+
+- `h1:accept_upgrade/3` now strips any caller-supplied `Connection` or
+  `Upgrade` headers (case-insensitive) from ExtraHeaders before adding
+  its own, so the 101 response carries exactly one of each with h1's
+  canonical values. Previously a caller passing them produced duplicate
+  headers, which spec-strict WebSocket clients (Safari, undici) reject.
+
 ## [0.6.0] - 2026-06-05
 
 ### Added
