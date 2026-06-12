@@ -3,7 +3,7 @@
 %%
 {application, h1,
  [{description, "HTTP/1.1 protocol library for Erlang"},
-  {vsn, "0.6.1"},
+  {vsn, "0.6.2"},
   {registered, [h1_sup]},
   {mod, {h1_app, []}},
   {applications,
