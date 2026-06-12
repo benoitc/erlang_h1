@@ -268,6 +268,26 @@ collect_body(Id, Acc) ->
     end.
 ```
 
+### Responding before the body is read
+
+A handler may respond before it has read the whole request body, e.g. to reject
+an oversized upload with `413`. When h1 sees the response committed while the
+request body is still incoming, it adds `Connection: close` to the response,
+sends it, then drains and discards the rest of the inbound body before closing
+the socket. This delivers the response cleanly instead of resetting the
+connection mid-upload, and means the connection is not reused for keep-alive in
+that case. The drain is bounded by `lingering_timeout` (default `5000` ms).
+
+```erlang
+reject(Conn, Id, _Method, _Path, _Headers) ->
+    %% Respond on the first body event without reading the rest.
+    receive
+        {h1_stream, Id, {data, _Bin, _End}} ->
+            h1:respond(Conn, Id, 413, [{<<"content-type">>, <<"text/plain">>}],
+                       <<"too large">>)
+    end.
+```
+
 ### Chunked response
 
 When the body length isn't known up front, declare `Transfer-Encoding: chunked` and stream with `send_data/4`:
@@ -444,9 +464,14 @@ Or pin a specific CA chain:
   handshake_timeout      => timeout(),                 %% default: 30_000
   idle_timeout           => timeout() | infinity,
   request_timeout        => timeout() | infinity,
+  lingering_timeout      => timeout(),                 %% default: 5_000
   max_keepalive_requests => pos_integer(),
   max_body_size          => pos_integer() | infinity}.
 ```
+
+`lingering_timeout` bounds how long the server drains an unread request body
+after responding early (see "Responding before the body is read") before
+closing the socket.
 
 ### Timeouts and slowloris
 

@@ -283,6 +283,12 @@ send_response(Conn, StreamId, Status, Headers) ->
 %% the headers carry neither Content-Length nor Transfer-Encoding, so the
 %% body is sent fixed-length rather than chunked. Use this for fully-known
 %% bodies; use send_response/4 + send_data/4 for streaming.
+%%
+%% If the request body has not been fully received when this is called (an
+%% early response, e.g. rejecting an oversized upload with 413), h1 adds
+%% `Connection: close', sends the response, then drains and discards the rest
+%% of the inbound body before closing the socket. The response is delivered
+%% cleanly and the connection is not reused.
 respond(Conn, StreamId, Status, Headers, Body) ->
     h1_connection:respond(Conn, StreamId, Status, Headers, Body).
 
@@ -296,6 +302,10 @@ send_data(Conn, StreamId, Data) ->
 
 -spec send_data(connection(), stream_id(), binary(), boolean()) ->
     ok | {error, term()}.
+%% @doc Send a body chunk. With `EndStream = true' the stream is ended; if the
+%% request body was not fully received first (server side), h1 advertises
+%% `Connection: close' and drains the remaining inbound body before closing,
+%% as for respond/5.
 send_data(Conn, StreamId, Data, EndStream) ->
     h1_connection:send_data(Conn, StreamId, Data, EndStream).
 

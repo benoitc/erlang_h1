@@ -4,6 +4,18 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- A server responding before the request body is fully read (e.g. rejecting an
+  oversized upload with 413) no longer resets the connection mid-upload. h1 now
+  adds `Connection: close`, sends the response, half-closes the write side, and
+  drains the remaining inbound body before closing, so the client receives the
+  response. The drain is bounded by the new `lingering_timeout` option (default
+  5 s) and discarded bytes are not parsed, so a large leftover body cannot trip
+  `max_body_size`.
+
 ## [0.6.1] - 2026-06-10
 
 ### Fixed

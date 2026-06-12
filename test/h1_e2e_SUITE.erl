@@ -18,13 +18,16 @@
     respond_full/1,
     keep_alive/1,
     pipelined/1,
+    early_response_unread_body/1,
+    early_response_streaming/1,
     get_tls/1,
     server_stop_is_clean/1
 ]).
 
 all() ->
     Base = [get_tcp, post_content_length, response_chunked, response_trailers,
-            respond_full, keep_alive, pipelined, server_stop_is_clean],
+            respond_full, keep_alive, pipelined, early_response_unread_body,
+            early_response_streaming, server_stop_is_clean],
     case os:find_executable("openssl") of
         false -> Base;
         _ -> Base ++ [get_tls]
@@ -99,6 +102,28 @@ respond_handler(Conn, StreamId, _M, _P, _H) ->
     ok = h1:respond(Conn, StreamId, 200,
                     [{<<"content-type">>, <<"application/json">>}],
                     <<"{\"ok\":true}">>).
+
+%% Reject on the first body chunk via respond/5, without reading the rest of
+%% the request body.
+early_413_handler(Conn, StreamId, _M, _P, _H) ->
+    receive
+        {h1_stream, StreamId, {data, _Chunk, _End}} ->
+            ok = h1:respond(Conn, StreamId, 413,
+                            [{<<"content-type">>, <<"text/plain">>}],
+                            <<"too large">>)
+    after 5000 ->
+        ok = h1:respond(Conn, StreamId, 413, [], <<"timeout">>)
+    end.
+
+%% Same early rejection, but via the streaming send_response + send_data path.
+early_413_stream_handler(Conn, StreamId, _M, _P, _H) ->
+    receive
+        {h1_stream, StreamId, {data, _Chunk, _End}} ->
+            ok = h1:send_response(Conn, StreamId, 413,
+                                  [{<<"content-length">>, <<"3">>}]),
+            ok = h1:send_data(Conn, StreamId, <<"no!">>, true)
+    after 5000 -> ok
+    end.
 
 %% ----------------------------------------------------------------------------
 %% Tests
@@ -202,6 +227,29 @@ pipelined(Config0) ->
     ?assertEqual(<<"hello world">>, B2),
     h1:close(Conn).
 
+%% Responding before the request body is fully read must deliver the response
+%% (with Connection: close) and then close the socket cleanly, instead of
+%% RST-ing mid-upload. A small max_body_size ensures the unread remainder
+%% would trip the body cap if the connection were still parsing it.
+early_response_unread_body(_Config) ->
+    {Status, Hdrs, Body, Close} =
+        early_response_probe(fun early_413_handler/5),
+    ?assertEqual(413, Status),
+    ?assertEqual(<<"close">>, header(<<"connection">>, Hdrs)),
+    ?assertEqual(<<"too large">>, Body),
+    ?assertEqual({error, closed}, Close),
+    ok.
+
+%% Same guarantee on the streaming send_response + send_data(EndStream) path.
+early_response_streaming(_Config) ->
+    {Status, Hdrs, Body, Close} =
+        early_response_probe(fun early_413_stream_handler/5),
+    ?assertEqual(413, Status),
+    ?assertEqual(<<"close">>, header(<<"connection">>, Hdrs)),
+    ?assertEqual(<<"no!">>, Body),
+    ?assertEqual({error, closed}, Close),
+    ok.
+
 get_tls(Config0) ->
     {CertFile, KeyFile} = make_selfsigned_cert(?config(priv_dir, Config0)),
     Opts = #{transport => ssl,
@@ -241,6 +289,83 @@ start_tcp_server(Handler, Config) ->
     Opts = #{transport => tcp, handler => Handler, acceptors => 1},
     {ok, Ref} = h1:start_server(0, Opts),
     [{server_ref, Ref} | Config].
+
+%% Start a server with a small body cap, drive a POST whose body is sent in
+%% two parts: a small first chunk that reaches the handler, then a large
+%% remainder the handler never reads. Returns the parsed response and the
+%% result of the recv that observes the socket close.
+early_response_probe(Handler) ->
+    Opts = #{transport => tcp, handler => Handler, acceptors => 1,
+             max_body_size => 4096},
+    {ok, Ref} = h1:start_server(0, Opts),
+    try
+        Port = h1:server_port(Ref),
+        {ok, Sock} = gen_tcp:connect("127.0.0.1", Port,
+                                     [binary, {active, false}, {packet, raw}]),
+        Total = 200000,
+        Req = [<<"POST /upload HTTP/1.1\r\n">>,
+               <<"host: localhost\r\n">>,
+               <<"content-length: ">>, integer_to_binary(Total), <<"\r\n\r\n">>],
+        ok = gen_tcp:send(Sock, Req),
+        ok = gen_tcp:send(Sock, binary:copy(<<"x">>, 100)),
+        %% Let the handler respond and the connection enter lingering close,
+        %% then send the rest (would trip max_body_size if still parsed).
+        timer:sleep(200),
+        _ = gen_tcp:send(Sock, binary:copy(<<"x">>, Total - 100)),
+        {Status, Hdrs, Body} = recv_http_response(Sock),
+        Close = drain_until_closed(Sock),
+        gen_tcp:close(Sock),
+        {Status, Hdrs, Body, Close}
+    after
+        h1:stop_server(Ref)
+    end.
+
+recv_http_response(Sock) ->
+    {Head, Rest} = recv_until_headers(Sock, <<>>),
+    [StatusLine | HeaderLines] = binary:split(Head, <<"\r\n">>, [global]),
+    [_Version, StatusBin | _] = binary:split(StatusLine, <<" ">>, [global]),
+    Status = binary_to_integer(StatusBin),
+    Hdrs = [parse_header(L) || L <- HeaderLines, L =/= <<>>],
+    CL = case header(<<"content-length">>, Hdrs) of
+        undefined -> 0;
+        V -> binary_to_integer(V)
+    end,
+    Body = recv_body(Sock, Rest, CL),
+    {Status, Hdrs, Body}.
+
+recv_until_headers(Sock, Acc) ->
+    case binary:match(Acc, <<"\r\n\r\n">>) of
+        {Pos, _} ->
+            <<Head:Pos/binary, _:4/binary, Rest/binary>> = Acc,
+            {Head, Rest};
+        nomatch ->
+            case gen_tcp:recv(Sock, 0, 5000) of
+                {ok, Data} -> recv_until_headers(Sock, <<Acc/binary, Data/binary>>);
+                {error, R} -> ct:fail({headers_recv_failed, R, Acc})
+            end
+    end.
+
+recv_body(_Sock, Acc, CL) when byte_size(Acc) >= CL ->
+    <<Body:CL/binary, _/binary>> = Acc,
+    Body;
+recv_body(Sock, Acc, CL) ->
+    case gen_tcp:recv(Sock, 0, 5000) of
+        {ok, Data} -> recv_body(Sock, <<Acc/binary, Data/binary>>, CL);
+        {error, R} -> ct:fail({body_recv_failed, R, Acc})
+    end.
+
+drain_until_closed(Sock) ->
+    case gen_tcp:recv(Sock, 0, 5000) of
+        {ok, _} -> drain_until_closed(Sock);
+        {error, R} -> {error, R}
+    end.
+
+parse_header(Line) ->
+    [Name, Value] = binary:split(Line, <<":">>),
+    {string:lowercase(string:trim(Name)), string:trim(Value)}.
+
+header(Name, Hdrs) ->
+    proplists:get_value(Name, Hdrs).
 
 collect_response(Conn, Id) ->
     collect_response(Conn, Id, undefined, [], <<>>).
