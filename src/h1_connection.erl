@@ -116,6 +116,10 @@
     %% Timeouts.
     idle_timeout = 300000  :: timeout(),
     request_timeout = 60000 :: timeout(),
+    %% Bound on the lingering-close drain (server): how long to read and
+    %% discard an unfinished request body after an early response before
+    %% closing the socket. See the `lingering_close' state.
+    lingering_timeout = 5000 :: timeout(),
     %% Upgrade handoff (synchronous server-side accept).
     upgrade_accept         :: undefined | {pid(), reference(), stream_id()},
     %% Shutdown policy.
@@ -291,6 +295,7 @@ init({Mode, Socket, Owner, Opts}) ->
         parser_opts = ParserOpts,
         idle_timeout = maps:get(idle_timeout, Opts, 300000),
         request_timeout = maps:get(request_timeout, Opts, 60000),
+        lingering_timeout = maps:get(lingering_timeout, Opts, 5000),
         pipeline_enabled = maps:get(pipeline, Opts, true),
         max_keepalive_requests = maps:get(max_keepalive_requests, Opts, 100),
         next_stream_id = 1
@@ -331,6 +336,36 @@ handle_event({call, From}, wait_connected, _OtherState,
 handle_event({call, From}, wait_connected, _OtherState,
              #state{wait_connected_waiters = W} = State) ->
     {keep_state, State#state{wait_connected_waiters = [From | W]}};
+
+%% --- lingering close --------------------------------------------------------
+%% After an early response (request body not fully received) we drain and
+%% discard inbound bytes until the peer closes or the linger timer fires, then
+%% close. Discarded raw, never parsed, so a large leftover body cannot trip the
+%% body-size cap and RST the socket before the client reads the response.
+
+handle_event(info, {tcp, Sock, _Data}, lingering_close,
+             #state{socket = Sock, transport = gen_tcp} = State) ->
+    {keep_state, set_active_once(State)};
+handle_event(info, {ssl, Sock, _Data}, lingering_close,
+             #state{socket = Sock, transport = ssl} = State) ->
+    {keep_state, set_active_once(State)};
+handle_event(info, {tcp_closed, Sock}, lingering_close,
+             #state{socket = Sock} = State) ->
+    {stop, {shutdown, closed}, State};
+handle_event(info, {ssl_closed, Sock}, lingering_close,
+             #state{socket = Sock} = State) ->
+    {stop, {shutdown, closed}, State};
+handle_event(info, {tcp_error, Sock, _R}, lingering_close,
+             #state{socket = Sock} = State) ->
+    {stop, {shutdown, closed}, State};
+handle_event(info, {ssl_error, Sock, _R}, lingering_close,
+             #state{socket = Sock} = State) ->
+    {stop, {shutdown, closed}, State};
+handle_event({timeout, linger}, linger, lingering_close, State) ->
+    {stop, {shutdown, lingering_timeout}, State};
+handle_event({call, From}, _Msg, lingering_close, _State) ->
+    %% The stream is finished and the connection is closing.
+    {keep_state_and_data, [{reply, From, {error, closed}}]};
 
 %% --- socket I/O -------------------------------------------------------------
 
@@ -514,6 +549,13 @@ sock_send(#state{transport = ssl,    socket = S}, Data) -> ssl:send(S, Data).
 
 close_socket(gen_tcp, S) -> gen_tcp:close(S);
 close_socket(ssl, S)     -> ssl:close(S).
+
+%% Half-close the write side (send FIN) once the final response is on the
+%% wire, so the peer learns we are done before we drain its remaining body.
+sock_shutdown_write(#state{transport = gen_tcp, socket = S}) ->
+    _ = gen_tcp:shutdown(S, write), ok;
+sock_shutdown_write(#state{transport = ssl, socket = S}) ->
+    _ = ssl:shutdown(S, write), ok.
 
 maybe_notify_connected(#state{connected_acked = true} = St) -> St;
 maybe_notify_connected(#state{owner = Owner,
@@ -1053,15 +1095,19 @@ handle_send_response(From, StreamId, Status, Headers, State0) ->
     end,
     case maps:find(StreamId, State#state.streams) of
         {ok, Stream} ->
-            {Framing, HeadersWire} = prepare_response(Headers, no_body, State),
+            %% If the request body is still incoming, the connection will
+            %% close after this response — commit Connection: close now,
+            %% before any send_data, so it is in the header block.
+            State0b = maybe_set_early_close(StreamId, State),
+            {Framing, HeadersWire} = prepare_response(Headers, no_body, State0b),
             Stream1 = Stream#stream{status = Status, resp_headers = Headers,
                                     resp_framing = Framing, state = open},
             Wire = [h1_message:status_line(Status, ?HTTP_1_1),
                     h1_message:headers(HeadersWire),
                     <<"\r\n">>],
-            case sock_send(State, Wire) of
+            case sock_send(State0b, Wire) of
                 ok ->
-                    State1 = put_stream(Stream1, State),
+                    State1 = put_stream(Stream1, State0b),
                     {keep_state, State1, [{reply, From, ok} | ResumeActions]};
                 {error, R} ->
                     {keep_state_and_data, [{reply, From, {error, R}}]}
@@ -1080,34 +1126,73 @@ handle_respond(From, StreamId, Status, Headers0, Body, State0) ->
     end,
     case maps:find(StreamId, State#state.streams) of
         {ok, Stream} ->
-            {Framing, HeadersWire} = prepare_response(Headers0, Body, State),
+            %% Committing a final response before the request body has been
+            %% fully received: advertise Connection: close and linger-close
+            %% (RFC 9112 §6.6) so the client reads the response before FIN.
+            State0b = maybe_set_early_close(StreamId, State),
+            {Framing, HeadersWire} = prepare_response(Headers0, Body, State0b),
             BodyWire = frame_body(Stream#stream{resp_framing = Framing}, Body, true),
             Wire = [h1_message:status_line(Status, ?HTTP_1_1),
                     h1_message:headers(HeadersWire),
                     <<"\r\n">>,
                     BodyWire],
-            case sock_send(State, Wire) of
+            case sock_send(State0b, Wire) of
                 ok ->
                     Stream1 = Stream#stream{status = Status, resp_headers = Headers0,
                                             resp_framing = Framing,
                                             state = half_closed_local},
-                    State1 = put_stream(Stream1, State),
+                    State1 = put_stream(Stream1, State0b),
                     State2 = maybe_close_server_stream(StreamId, State1),
-                    case State2#state.close_after andalso State2#state.mode =:= server of
-                        true ->
-                            {stop_and_reply,
-                             {shutdown, goaway_sent},
-                             [{reply, From, ok} | ResumeActions],
-                             State2};
-                        false ->
-                            {keep_state, State2, [{reply, From, ok} | ResumeActions]}
-                    end;
+                    finish_server_send(From, StreamId, ResumeActions, State2);
                 {error, R} ->
                     {keep_state_and_data, [{reply, From, {error, R}}]}
             end;
         error ->
             {keep_state_and_data, [{reply, From, {error, unknown_stream}}]}
     end.
+
+%% A stream whose inbound side is not at end_stream when we commit a response
+%% must close: set `close_after' so prepare_response/augment add
+%% `Connection: close', and so the post-send logic enters the lingering close.
+maybe_set_early_close(StreamId, #state{mode = server, streams = Streams} = State) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream{recv_ended = false}} -> State#state{close_after = true};
+        _ -> State
+    end;
+maybe_set_early_close(_StreamId, State) ->
+    State.
+
+%% Decide what to do once a server response (or final body chunk) is flushed.
+%% maybe_close_server_stream/2 has already run:
+%%   - stream removed         -> both sides done; close if `close_after', else
+%%                               keep the connection alive for the next request.
+%%   - stream present, closed -> early response; request body unfinished. Drain
+%%                               and discard it (lingering close) so the client
+%%                               receives the response before the socket closes.
+%%   - stream present, open   -> mid-response streaming; keep going.
+finish_server_send(From, StreamId, ResumeActions, State) ->
+    Actions = [{reply, From, ok} | ResumeActions],
+    case maps:find(StreamId, State#state.streams) of
+        {ok, #stream{state = closed}} when State#state.mode =:= server ->
+            enter_lingering_close(Actions, State);
+        error when State#state.close_after andalso State#state.mode =:= server ->
+            {stop_and_reply, {shutdown, goaway_sent}, Actions, State};
+        _ ->
+            {keep_state, State, Actions}
+    end.
+
+%% Send FIN now that the full response is on the wire, then read and discard
+%% the rest of the inbound body until the peer closes or the linger timer
+%% fires. Inbound bytes are NOT fed to the parser here, so an oversized
+%% leftover body cannot trip the body-size cap and RST the connection.
+enter_lingering_close(ReplyActions, State) ->
+    _ = sock_shutdown_write(State),
+    State1 = set_active_once(State),
+    Actions = ReplyActions
+              ++ [{{timeout, idle}, infinity, idle},
+                  {{timeout, request}, infinity, request},
+                  {{timeout, linger}, State1#state.lingering_timeout, linger}],
+    {next_state, lingering_close, State1, Actions}.
 
 %% Decide framing and build the response header block in a single pass over
 %% the caller's headers, instead of rescanning (and re-lowercasing every
@@ -1190,16 +1275,7 @@ handle_send_data(From, StreamId, Data, EndStream, State) ->
                     end,
                     State1 = put_stream(Stream1, State),
                     State2 = maybe_close_server_stream(StreamId, State1),
-                    case EndStream andalso State2#state.close_after
-                         andalso State2#state.mode =:= server of
-                        true ->
-                            {stop_and_reply,
-                             {shutdown, goaway_sent},
-                             [{reply, From, ok}],
-                             State2};
-                        false ->
-                            {keep_state, State2, [{reply, From, ok}]}
-                    end;
+                    finish_server_send(From, StreamId, [], State2);
                 {error, R} ->
                     {keep_state_and_data, [{reply, From, {error, R}}]}
             end;
