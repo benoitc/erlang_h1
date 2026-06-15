@@ -20,6 +20,11 @@
     pipelined/1,
     early_response_unread_body/1,
     early_response_streaming/1,
+    early_response_paced_upload/1,
+    early_response_drain_bounded/1,
+    early_response_drain_disabled/1,
+    early_response_respond6_override/1,
+    early_response_lingering_timeout_alias/1,
     get_tls/1,
     server_stop_is_clean/1
 ]).
@@ -27,7 +32,10 @@
 all() ->
     Base = [get_tcp, post_content_length, response_chunked, response_trailers,
             respond_full, keep_alive, pipelined, early_response_unread_body,
-            early_response_streaming, server_stop_is_clean],
+            early_response_streaming, early_response_paced_upload,
+            early_response_drain_bounded, early_response_drain_disabled,
+            early_response_respond6_override,
+            early_response_lingering_timeout_alias, server_stop_is_clean],
     case os:find_executable("openssl") of
         false -> Base;
         _ -> Base ++ [get_tls]
@@ -123,6 +131,19 @@ early_413_stream_handler(Conn, StreamId, _M, _P, _H) ->
                                   [{<<"content-length">>, <<"3">>}]),
             ok = h1:send_data(Conn, StreamId, <<"no!">>, true)
     after 5000 -> ok
+    end.
+
+%% Early 413 via respond/6 with a per-response drain budget that overrides
+%% the listener default (used to drain when the listener disabled it).
+early_413_respond6_handler(Conn, StreamId, _M, _P, _H) ->
+    receive
+        {h1_stream, StreamId, {data, _Chunk, _End}} ->
+            ok = h1:respond(Conn, StreamId, 413,
+                            [{<<"content-type">>, <<"text/plain">>}],
+                            <<"too large">>,
+                            #{early_response_drain => {infinity, 30000}})
+    after 5000 ->
+        ok = h1:respond(Conn, StreamId, 413, [], <<"timeout">>)
     end.
 
 %% ----------------------------------------------------------------------------
@@ -250,6 +271,99 @@ early_response_streaming(_Config) ->
     ?assertEqual({error, closed}, Close),
     ok.
 
+%% A large body uploaded in paced chunks (so the upload outlives the response)
+%% is still answered with 413 and the socket closes cleanly afterwards, every
+%% time. This is the standalone reproduction harness, adapted to the h1 API.
+early_response_paced_upload(_Config) ->
+    Opts = #{transport => tcp, handler => fun early_413_handler/5,
+             acceptors => 2, max_body_size => 4096},
+    {ok, Ref} = h1:start_server(0, Opts),
+    try
+        Port = h1:server_port(Ref),
+        Results = [paced_upload_once(Port, 2 * 1024 * 1024, 64 * 1024, 1)
+                   || _ <- lists:seq(1, 5)],
+        ?assertEqual([], [R || R <- Results, R =/= {ok, 413}])
+    after
+        h1:stop_server(Ref)
+    end.
+
+%% A small drain budget is honored: with no further inbound body and no peer
+%% FIN, the server still closes once the time budget elapses rather than
+%% hanging for the 30 s default. The response is delivered first.
+early_response_drain_bounded(_Config) ->
+    Opts = #{transport => tcp, handler => fun early_413_handler/5,
+             acceptors => 1, max_body_size => 4096,
+             early_response_drain => {infinity, 300}},
+    {ok, Ref} = h1:start_server(0, Opts),
+    try
+        Port = h1:server_port(Ref),
+        Sock = send_head_and_first_chunk(Port, 1000000, 1024),
+        {Status, Hdrs, _Body} = recv_http_response(Sock),
+        ?assertEqual(413, Status),
+        ?assertEqual(<<"close">>, header(<<"connection">>, Hdrs)),
+        %% Stall: send nothing more, never close. The 300 ms linger budget
+        %% must fire and close the socket well under the 30 s default.
+        T0 = erlang:monotonic_time(millisecond),
+        ?assertEqual({error, closed}, drain_until_closed(Sock)),
+        Elapsed = erlang:monotonic_time(millisecond) - T0,
+        ?assert(Elapsed < 3000),
+        gen_tcp:close(Sock)
+    after
+        h1:stop_server(Ref)
+    end.
+
+%% early_response_drain => 0 disables the drain: the listener is accepted and
+%% the connection closes promptly instead of lingering.
+early_response_drain_disabled(_Config) ->
+    Opts = #{transport => tcp, handler => fun early_413_handler/5,
+             acceptors => 1, max_body_size => 4096,
+             early_response_drain => 0},
+    {ok, Ref} = h1:start_server(0, Opts),
+    try
+        Port = h1:server_port(Ref),
+        Sock = send_head_and_first_chunk(Port, 1000000, 1024),
+        T0 = erlang:monotonic_time(millisecond),
+        %% With the drain disabled the socket closes right away; the response
+        %% may or may not be read depending on the kernel, but we must not
+        %% block for the linger budget.
+        _ = drain_until_closed(Sock),
+        Elapsed = erlang:monotonic_time(millisecond) - T0,
+        ?assert(Elapsed < 3000),
+        gen_tcp:close(Sock)
+    after
+        h1:stop_server(Ref)
+    end.
+
+%% A per-response respond/6 budget overrides a listener that disabled the
+%% drain, so the paced upload is still answered cleanly.
+early_response_respond6_override(_Config) ->
+    Opts = #{transport => tcp, handler => fun early_413_respond6_handler/5,
+             acceptors => 1, max_body_size => 4096,
+             early_response_drain => 0},
+    {ok, Ref} = h1:start_server(0, Opts),
+    try
+        Port = h1:server_port(Ref),
+        ?assertEqual({ok, 413},
+                     paced_upload_once(Port, 2 * 1024 * 1024, 64 * 1024, 1))
+    after
+        h1:stop_server(Ref)
+    end.
+
+%% The legacy lingering_timeout option still works: it sets the drain's time
+%% bound (with no byte cap) and is wired through start_server.
+early_response_lingering_timeout_alias(_Config) ->
+    Opts = #{transport => tcp, handler => fun early_413_handler/5,
+             acceptors => 1, max_body_size => 4096,
+             lingering_timeout => 30000},
+    {ok, Ref} = h1:start_server(0, Opts),
+    try
+        Port = h1:server_port(Ref),
+        ?assertEqual({ok, 413},
+                     paced_upload_once(Port, 2 * 1024 * 1024, 64 * 1024, 1))
+    after
+        h1:stop_server(Ref)
+    end.
+
 get_tls(Config0) ->
     {CertFile, KeyFile} = make_selfsigned_cert(?config(priv_dir, Config0)),
     Opts = #{transport => ssl,
@@ -318,6 +432,45 @@ early_response_probe(Handler) ->
         {Status, Hdrs, Body, Close}
     after
         h1:stop_server(Ref)
+    end.
+
+%% Open a connection, send the request head (declaring a Total-byte body) plus
+%% a `First'-byte first chunk so the handler is dispatched and can early-reject.
+%% The rest of the body is left unsent.
+send_head_and_first_chunk(Port, Total, First) ->
+    {ok, Sock} = gen_tcp:connect("127.0.0.1", Port,
+                                 [binary, {active, false}, {packet, raw},
+                                  {nodelay, true}, {send_timeout, 15000}]),
+    Req = [<<"POST /upload HTTP/1.1\r\n">>,
+           <<"host: localhost\r\n">>,
+           <<"content-length: ">>, integer_to_binary(Total), <<"\r\n\r\n">>],
+    ok = gen_tcp:send(Sock, Req),
+    ok = gen_tcp:send(Sock, binary:copy(<<"x">>, First)),
+    Sock.
+
+%% Send a Total-byte body in `Chunk'-sized pieces `SleepMs' apart, then read
+%% the status. Returns {ok, Status} or {error, Reason}. The client sends the
+%% whole body before reading, exposing the early-response/socket-close race.
+paced_upload_once(Port, Total, Chunk, SleepMs) ->
+    Sock = send_head_and_first_chunk(Port, Total, Chunk),
+    _ = send_paced(Sock, Total - Chunk, Chunk, SleepMs),
+    Result = try recv_http_response(Sock) of
+        {Status, _Hdrs, _Body} -> {ok, Status}
+    catch
+        _:Reason -> {error, Reason}
+    end,
+    gen_tcp:close(Sock),
+    Result.
+
+send_paced(_Sock, Remaining, _Chunk, _SleepMs) when Remaining =< 0 -> ok;
+send_paced(Sock, Remaining, Chunk, SleepMs) ->
+    N = min(Remaining, Chunk),
+    case gen_tcp:send(Sock, binary:copy(<<"x">>, N)) of
+        ok ->
+            timer:sleep(SleepMs),
+            send_paced(Sock, Remaining - N, Chunk, SleepMs);
+        {error, _} ->
+            send_failed
     end.
 
 recv_http_response(Sock) ->

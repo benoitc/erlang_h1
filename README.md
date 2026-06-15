@@ -34,11 +34,11 @@ was already taken on hex.pm). The OTP application and module atom stay
 
 ```erlang
 %% rebar.config — from hex
-{deps, [{erlang_h1, "0.6.2"}]}.
+{deps, [{erlang_h1, "0.7.0"}]}.
 
 %% Or directly from git
 {deps, [
-    {erlang_h1, {git, "https://github.com/benoitc/erlang_h1.git", {tag, "0.6.2"}}}
+    {erlang_h1, {git, "https://github.com/benoitc/erlang_h1.git", {tag, "0.7.0"}}}
 ]}.
 ```
 
@@ -273,10 +273,10 @@ collect_body(Id, Acc) ->
 A handler may respond before it has read the whole request body, e.g. to reject
 an oversized upload with `413`. When h1 sees the response committed while the
 request body is still incoming, it adds `Connection: close` to the response,
-sends it, then drains and discards the rest of the inbound body before closing
-the socket. This delivers the response cleanly instead of resetting the
-connection mid-upload, and means the connection is not reused for keep-alive in
-that case. The drain is bounded by `lingering_timeout` (default `5000` ms).
+sends it, half-closes the write side, then drains and discards the rest of the
+inbound body before closing the socket. This delivers the response cleanly
+instead of resetting the connection mid-upload, and means the connection is not
+reused for keep-alive in that case.
 
 ```erlang
 reject(Conn, Id, _Method, _Path, _Headers) ->
@@ -287,6 +287,29 @@ reject(Conn, Id, _Method, _Path, _Headers) ->
                        <<"too large">>)
     end.
 ```
+
+The drain is bounded by `early_response_drain`, a `{MaxBytes, MaxMs}` budget set
+on the listener (default `{infinity, 30000}` — discard until the peer closes or
+30 s elapses, no byte cap). Either component may be `infinity`; `0` disables the
+drain and closes immediately. If the budget is spent before the peer closes, the
+socket is closed (which may reset the upload). Raise it for large uploads on slow
+links, or cap `MaxBytes` to bound how much you are willing to read and discard:
+
+```erlang
+h1:start_server(8080, #{handler => fun reject/5,
+                        early_response_drain => {16#1000000, 30000}}).  %% 16 MiB / 30 s
+```
+
+Override it for a single response with `respond/6` — useful when one endpoint
+accepts much larger uploads than the listener default:
+
+```erlang
+h1:respond(Conn, Id, 413, Headers, Body,
+           #{early_response_drain => {64 * 1024 * 1024, 60000}}).
+```
+
+The legacy `lingering_timeout => Ms` option still works and maps to
+`{infinity, Ms}`.
 
 ### Chunked response
 
@@ -464,14 +487,16 @@ Or pin a specific CA chain:
   handshake_timeout      => timeout(),                 %% default: 30_000
   idle_timeout           => timeout() | infinity,
   request_timeout        => timeout() | infinity,
-  lingering_timeout      => timeout(),                 %% default: 5_000
+  early_response_drain   => 0 | {MaxBytes, MaxMs},     %% default: {infinity, 30_000}
   max_keepalive_requests => pos_integer(),
   max_body_size          => pos_integer() | infinity}.
 ```
 
-`lingering_timeout` bounds how long the server drains an unread request body
-after responding early (see "Responding before the body is read") before
-closing the socket.
+`early_response_drain` bounds how much of an unread request body the server
+reads and discards after responding early (see "Responding before the body is
+read") before closing the socket: a `{MaxBytes, MaxMs}` budget where either
+component may be `infinity`, or `0` to disable the drain. The legacy
+`lingering_timeout => Ms` option is still accepted and maps to `{infinity, Ms}`.
 
 ### Timeouts and slowloris
 

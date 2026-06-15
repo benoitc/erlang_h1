@@ -30,7 +30,7 @@
 -export([activate/1]).
 -export([wait_connected/1, wait_connected/2]).
 -export([send_request/5, send_request_with_body/5]).
--export([send_response/4, respond/5]).
+-export([send_response/4, respond/5, respond/6]).
 -export([send_data/3, send_data/4]).
 -export([send_trailers/3]).
 -export([continue/2]).
@@ -56,6 +56,14 @@
 -type version() :: {non_neg_integer(), non_neg_integer()}.
 -type headers() :: [{binary(), iodata()}].
 -type reason() :: term().
+
+%% Bound on the early-response inbound drain (lingering close). `disabled'
+%% skips the drain and closes immediately; `{MaxBytes, MaxMs}' reads and
+%% discards up to MaxBytes / MaxMs (either component `infinity') before
+%% closing. See `enter_lingering_close/3'.
+-type drain_budget() :: disabled
+                      | {non_neg_integer() | infinity,
+                         non_neg_integer() | infinity}.
 
 -record(stream, {
     id                    :: stream_id(),
@@ -116,10 +124,14 @@
     %% Timeouts.
     idle_timeout = 300000  :: timeout(),
     request_timeout = 60000 :: timeout(),
-    %% Bound on the lingering-close drain (server): how long to read and
-    %% discard an unfinished request body after an early response before
-    %% closing the socket. See the `lingering_close' state.
-    lingering_timeout = 5000 :: timeout(),
+    %% Bound on the lingering-close drain (server): read and discard an
+    %% unfinished request body after an early response, up to this
+    %% {MaxBytes, MaxMs} budget, before closing the socket. See the
+    %% `lingering_close' state and `enter_lingering_close/3'.
+    drain_budget = {infinity, 30000} :: drain_budget(),
+    %% Bytes still allowed to be discarded during the current drain
+    %% (set from the budget on entering `lingering_close').
+    drain_left             :: undefined | non_neg_integer() | infinity,
     %% Upgrade handoff (synchronous server-side accept).
     upgrade_accept         :: undefined | {pid(), reference(), stream_id()},
     %% Shutdown policy.
@@ -179,7 +191,13 @@ send_response(Pid, StreamId, Status, Headers) ->
 %% @doc Server: send a complete response (status, headers, body) in one
 %% socket write and end the stream.
 respond(Pid, StreamId, Status, Headers, Body) ->
-    gen_statem:call(Pid, {respond, StreamId, Status, Headers, Body}).
+    respond(Pid, StreamId, Status, Headers, Body, #{}).
+
+%% @doc As respond/5, with per-response options. `early_response_drain'
+%% overrides the listener's early-response drain budget for this response
+%% (see drain_budget_from_opts/1 for accepted forms).
+respond(Pid, StreamId, Status, Headers, Body, Opts) when is_map(Opts) ->
+    gen_statem:call(Pid, {respond, StreamId, Status, Headers, Body, Opts}).
 
 send_data(Pid, StreamId, Data) ->
     send_data(Pid, StreamId, Data, false).
@@ -295,7 +313,7 @@ init({Mode, Socket, Owner, Opts}) ->
         parser_opts = ParserOpts,
         idle_timeout = maps:get(idle_timeout, Opts, 300000),
         request_timeout = maps:get(request_timeout, Opts, 60000),
-        lingering_timeout = maps:get(lingering_timeout, Opts, 5000),
+        drain_budget = drain_budget_from_opts(Opts),
         pipeline_enabled = maps:get(pipeline, Opts, true),
         max_keepalive_requests = maps:get(max_keepalive_requests, Opts, 100),
         next_stream_id = 1
@@ -304,6 +322,39 @@ init({Mode, Socket, Owner, Opts}) ->
 
 parser_opts_from(client, Opts) -> parser_base_opts(response, Opts);
 parser_opts_from(server, Opts) -> parser_base_opts(request, Opts).
+
+%% Connection-level default drain budget. `early_response_drain' takes
+%% precedence; `lingering_timeout' is the legacy time-only form
+%% (`{infinity, Ms}'); otherwise the 30 s default applies.
+drain_budget_from_opts(Opts) ->
+    case maps:find(early_response_drain, Opts) of
+        {ok, B}  -> normalize_drain_budget(B);
+        error ->
+            case maps:find(lingering_timeout, Opts) of
+                {ok, Ms} -> normalize_drain_budget({infinity, Ms});
+                error    -> {infinity, 30000}
+            end
+    end.
+
+%% Resolve the budget for one early response: a per-call
+%% `early_response_drain' (respond/6) overrides the connection default.
+drain_budget_for(Opts, Default) ->
+    case maps:find(early_response_drain, Opts) of
+        {ok, B} -> normalize_drain_budget(B);
+        error   -> Default
+    end.
+
+%% Accepted forms: `0' / `disabled' disable the drain; `{MaxBytes, MaxMs}'
+%% bounds it (either component a non-negative integer or `infinity'). A zero
+%% component also disables, since it would close before discarding anything.
+normalize_drain_budget(0) -> disabled;
+normalize_drain_budget(disabled) -> disabled;
+normalize_drain_budget({0, _}) -> disabled;
+normalize_drain_budget({_, 0}) -> disabled;
+normalize_drain_budget({B, M} = Budget)
+  when (B =:= infinity orelse (is_integer(B) andalso B > 0)),
+       (M =:= infinity orelse (is_integer(M) andalso M > 0)) ->
+    Budget.
 
 parser_base_opts(Type, Opts) ->
     [Type
@@ -339,16 +390,17 @@ handle_event({call, From}, wait_connected, _OtherState,
 
 %% --- lingering close --------------------------------------------------------
 %% After an early response (request body not fully received) we drain and
-%% discard inbound bytes until the peer closes or the linger timer fires, then
-%% close. Discarded raw, never parsed, so a large leftover body cannot trip the
-%% body-size cap and RST the socket before the client reads the response.
+%% discard inbound bytes until the peer closes, the byte budget is spent, or
+%% the linger timer fires, then close. Discarded raw, never parsed, so a large
+%% leftover body cannot trip the body-size cap and RST the socket before the
+%% client reads the response.
 
-handle_event(info, {tcp, Sock, _Data}, lingering_close,
+handle_event(info, {tcp, Sock, Data}, lingering_close,
              #state{socket = Sock, transport = gen_tcp} = State) ->
-    {keep_state, set_active_once(State)};
-handle_event(info, {ssl, Sock, _Data}, lingering_close,
+    drain_discard(Data, State);
+handle_event(info, {ssl, Sock, Data}, lingering_close,
              #state{socket = Sock, transport = ssl} = State) ->
-    {keep_state, set_active_once(State)};
+    drain_discard(Data, State);
 handle_event(info, {tcp_closed, Sock}, lingering_close,
              #state{socket = Sock} = State) ->
     {stop, {shutdown, closed}, State};
@@ -413,10 +465,10 @@ handle_event({call, From}, {send_response, StreamId, Status, Headers, _Opts}, op
 handle_event({call, From}, {send_response, _, _, _, _}, _, #state{mode = Mode}) ->
     {keep_state_and_data, [{reply, From, {error, {bad_mode, Mode}}}]};
 
-handle_event({call, From}, {respond, StreamId, Status, Headers, Body}, open,
+handle_event({call, From}, {respond, StreamId, Status, Headers, Body, Opts}, open,
              #state{mode = server} = State) ->
-    handle_respond(From, StreamId, Status, Headers, Body, State);
-handle_event({call, From}, {respond, _, _, _, _}, _, #state{mode = Mode}) ->
+    handle_respond(From, StreamId, Status, Headers, Body, Opts, State);
+handle_event({call, From}, {respond, _, _, _, _, _}, _, #state{mode = Mode}) ->
     {keep_state_and_data, [{reply, From, {error, {bad_mode, Mode}}}]};
 
 %% --- common: send_data / send_trailers / continue ---------------------------
@@ -1119,13 +1171,16 @@ handle_send_response(From, StreamId, Status, Headers, State0) ->
 %% Send status line, headers, and body in a single socket write, then end
 %% the stream. Coalesces what send_response/4 + send_data/4 would do as two
 %% writes, framing the body with Content-Length.
-handle_respond(From, StreamId, Status, Headers0, Body, State0) ->
+handle_respond(From, StreamId, Status, Headers0, Body, Opts, State0) ->
     {State, ResumeActions} = case State0#state.upgrade_pending of
         true  -> {set_active_once(State0#state{upgrade_pending = false}), []};
         false -> {State0, []}
     end,
     case maps:find(StreamId, State#state.streams) of
         {ok, Stream} ->
+            %% Resolve the drain budget up front so an invalid per-response
+            %% `early_response_drain' is rejected before anything is sent.
+            Budget = drain_budget_for(Opts, State#state.drain_budget),
             %% Committing a final response before the request body has been
             %% fully received: advertise Connection: close and linger-close
             %% (RFC 9112 §6.6) so the client reads the response before FIN.
@@ -1143,7 +1198,8 @@ handle_respond(From, StreamId, Status, Headers0, Body, State0) ->
                                             state = half_closed_local},
                     State1 = put_stream(Stream1, State0b),
                     State2 = maybe_close_server_stream(StreamId, State1),
-                    finish_server_send(From, StreamId, ResumeActions, State2);
+                    finish_server_send(From, StreamId, ResumeActions,
+                                       Budget, State2);
                 {error, R} ->
                     {keep_state_and_data, [{reply, From, {error, R}}]}
             end;
@@ -1171,10 +1227,14 @@ maybe_set_early_close(_StreamId, State) ->
 %%                               receives the response before the socket closes.
 %%   - stream present, open   -> mid-response streaming; keep going.
 finish_server_send(From, StreamId, ResumeActions, State) ->
+    finish_server_send(From, StreamId, ResumeActions,
+                       State#state.drain_budget, State).
+
+finish_server_send(From, StreamId, ResumeActions, Budget, State) ->
     Actions = [{reply, From, ok} | ResumeActions],
     case maps:find(StreamId, State#state.streams) of
         {ok, #stream{state = closed}} when State#state.mode =:= server ->
-            enter_lingering_close(Actions, State);
+            enter_lingering_close(Actions, Budget, State);
         error when State#state.close_after andalso State#state.mode =:= server ->
             {stop_and_reply, {shutdown, goaway_sent}, Actions, State};
         _ ->
@@ -1182,17 +1242,35 @@ finish_server_send(From, StreamId, ResumeActions, State) ->
     end.
 
 %% Send FIN now that the full response is on the wire, then read and discard
-%% the rest of the inbound body until the peer closes or the linger timer
-%% fires. Inbound bytes are NOT fed to the parser here, so an oversized
-%% leftover body cannot trip the body-size cap and RST the connection.
-enter_lingering_close(ReplyActions, State) ->
+%% the rest of the inbound body until the peer closes, the byte budget runs
+%% out, or the linger timer fires. Inbound bytes are NOT fed to the parser
+%% here, so an oversized leftover body cannot trip the body-size cap and RST
+%% the connection. `disabled' skips the drain and closes right away (which may
+%% reset mid-upload — the explicit opt-out).
+enter_lingering_close(ReplyActions, disabled, State) ->
     _ = sock_shutdown_write(State),
-    State1 = set_active_once(State),
+    {stop_and_reply, {shutdown, early_close}, ReplyActions, State};
+enter_lingering_close(ReplyActions, {MaxBytes, MaxMs}, State) ->
+    _ = sock_shutdown_write(State),
+    State1 = set_active_once(State#state{drain_left = MaxBytes}),
     Actions = ReplyActions
               ++ [{{timeout, idle}, infinity, idle},
                   {{timeout, request}, infinity, request},
-                  {{timeout, linger}, State1#state.lingering_timeout, linger}],
+                  {{timeout, linger}, MaxMs, linger}],
     {next_state, lingering_close, State1, Actions}.
+
+%% Discard one inbound chunk during lingering close, debiting the byte budget.
+%% When the budget is spent we stop (close) rather than keep reading; with an
+%% `infinity' budget we only ever stop on the peer's FIN or the linger timer.
+drain_discard(_Data, #state{drain_left = infinity} = State) ->
+    {keep_state, set_active_once(State)};
+drain_discard(Data, #state{drain_left = Left} = State) ->
+    case Left - byte_size(Data) of
+        Remaining when Remaining > 0 ->
+            {keep_state, set_active_once(State#state{drain_left = Remaining})};
+        _ ->
+            {stop, {shutdown, drain_budget_exhausted}, State}
+    end.
 
 %% Decide framing and build the response header block in a single pass over
 %% the caller's headers, instead of rescanning (and re-lowercasing every
