@@ -4,6 +4,33 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-06-15
+
+### Fixed
+
+- The early-response inbound drain no longer resets the connection when the
+  upload outlives the drain bound. The bound was a hardcoded 5 s
+  `lingering_timeout` that was not even wired through `start_server`, so a large
+  body over a slow link kept uploading when the timer fired and the server
+  closed with unread data, sending RST and losing the response (e.g. a 413). The
+  drain is now a configurable `{MaxBytes, MaxMs}` budget defaulting to
+  `{infinity, 30000}`.
+
+### Added
+
+- `early_response_drain` listener option: a `{MaxBytes, MaxMs}` budget bounding
+  the early-response inbound drain (either component may be `infinity`; `0`
+  disables the drain). Default `{infinity, 30000}`.
+- `h1:respond/6` takes a per-response options map; `early_response_drain`
+  overrides the listener budget for that response.
+
+### Changed
+
+- The early-response drain default rose from 5 s to 30 s (no byte cap), matching
+  nginx's `lingering_time`, so large uploads on slow links deliver the response.
+- `lingering_timeout => Ms` is still accepted as the time-only form of
+  `early_response_drain` (`{infinity, Ms}`) and is now honored by `start_server`.
+
 ## [0.6.2] - 2026-06-12
 
 ### Fixed

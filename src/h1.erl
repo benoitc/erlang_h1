@@ -35,7 +35,7 @@
 
 %% Server API
 -export([start_server/2, start_server/3, stop_server/1, server_port/1]).
--export([send_response/4, respond/5]).
+-export([send_response/4, respond/5, respond/6]).
 
 %% Common API
 -export([send_data/3, send_data/4]).
@@ -87,12 +87,23 @@
     handshake_timeout => timeout(),
     idle_timeout => timeout(),
     request_timeout => timeout(),
+    early_response_drain => early_response_drain(),
     max_keepalive_requests => pos_integer(),
     max_header_block_size => pos_integer()
 }.
 
+%% Early-response inbound drain budget (lingering close). `{MaxBytes, MaxMs}'
+%% reads and discards an unfinished request body after an early response, up
+%% to MaxBytes / MaxMs (either component `infinity'), before closing. `0'
+%% disables the drain and closes immediately. Default `{infinity, 30000}'.
+-type early_response_drain() ::
+    0 | {non_neg_integer() | infinity, non_neg_integer() | infinity}.
+
+-type respond_opts() :: #{early_response_drain => early_response_drain()}.
+
 -export_type([connection/0, stream_id/0, headers/0, status/0, server_ref/0,
-              connect_opts/0, server_opts/0]).
+              connect_opts/0, server_opts/0, early_response_drain/0,
+              respond_opts/0]).
 
 %% ============================================================================
 %% Client
@@ -231,6 +242,7 @@ spawn_listener(Transport, ListenSocket, Bound, Opts) ->
     Handler = maps:get(handler, Opts),
     Acceptors = maps:get(acceptors, Opts, erlang:system_info(schedulers)),
     ConnOpts = maps:with([idle_timeout, request_timeout,
+                          early_response_drain, lingering_timeout,
                           max_keepalive_requests, pipeline,
                           max_line_length, max_empty_lines,
                           max_header_name_size, max_header_value_size,
@@ -288,9 +300,19 @@ send_response(Conn, StreamId, Status, Headers) ->
 %% early response, e.g. rejecting an oversized upload with 413), h1 adds
 %% `Connection: close', sends the response, then drains and discards the rest
 %% of the inbound body before closing the socket. The response is delivered
-%% cleanly and the connection is not reused.
+%% cleanly and the connection is not reused. The drain is bounded by the
+%% listener's `early_response_drain' budget (default `{infinity, 30000}').
 respond(Conn, StreamId, Status, Headers, Body) ->
     h1_connection:respond(Conn, StreamId, Status, Headers, Body).
+
+-spec respond(connection(), stream_id(), status(), headers(), iodata(),
+              respond_opts()) -> ok | {error, term()}.
+%% @doc As respond/5, with per-response options. `early_response_drain'
+%% overrides the listener's drain budget for this response only: pass a
+%% larger `{MaxBytes, MaxMs}' to a known-large upload endpoint, or `0' to
+%% close immediately without draining.
+respond(Conn, StreamId, Status, Headers, Body, Opts) ->
+    h1_connection:respond(Conn, StreamId, Status, Headers, Body, Opts).
 
 %% ============================================================================
 %% Common
