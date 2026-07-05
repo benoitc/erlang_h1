@@ -89,7 +89,8 @@
     request_timeout => timeout(),
     early_response_drain => early_response_drain(),
     max_keepalive_requests => pos_integer(),
-    max_header_block_size => pos_integer()
+    max_header_block_size => pos_integer(),
+    max_body_size => pos_integer() | infinity
 }.
 
 %% Early-response inbound drain budget (lingering close). `{MaxBytes, MaxMs}'
@@ -246,7 +247,8 @@ spawn_listener(Transport, ListenSocket, Bound, Opts) ->
                           max_keepalive_requests, pipeline,
                           max_line_length, max_empty_lines,
                           max_header_name_size, max_header_value_size,
-                          max_headers, max_header_block_size], Opts),
+                          max_headers, max_header_block_size,
+                          max_body_size], Opts),
     ServerOpts = maps:with([handshake_timeout], Opts),
     Ref = make_ref(),
     Args = #{transport => Transport,

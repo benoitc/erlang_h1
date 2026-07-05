@@ -25,6 +25,10 @@
     early_response_drain_disabled/1,
     early_response_respond6_override/1,
     early_response_lingering_timeout_alias/1,
+    max_body_size_raised_content_length/1,
+    max_body_size_raised_chunked/1,
+    max_body_size_infinity/1,
+    max_body_size_default_rejects/1,
     get_tls/1,
     server_stop_is_clean/1
 ]).
@@ -35,7 +39,10 @@ all() ->
             early_response_streaming, early_response_paced_upload,
             early_response_drain_bounded, early_response_drain_disabled,
             early_response_respond6_override,
-            early_response_lingering_timeout_alias, server_stop_is_clean],
+            early_response_lingering_timeout_alias,
+            max_body_size_raised_content_length, max_body_size_raised_chunked,
+            max_body_size_infinity, max_body_size_default_rejects,
+            server_stop_is_clean],
     case os:find_executable("openssl") of
         false -> Base;
         _ -> Base ++ [get_tls]
@@ -144,6 +151,26 @@ early_413_respond6_handler(Conn, StreamId, _M, _P, _H) ->
                             #{early_response_drain => {infinity, 30000}})
     after 5000 ->
         ok = h1:respond(Conn, StreamId, 413, [], <<"timeout">>)
+    end.
+
+%% Read the whole request body and reply with its total byte count as a
+%% short body, so the client's own response cap is never the thing under
+%% test when exercising the server-side max_body_size.
+count_body_handler(Conn, StreamId, _M, _P, _H) ->
+    Total = drain_request_body(StreamId, 0),
+    Body = integer_to_binary(Total),
+    ok = h1:respond(Conn, StreamId, 200,
+                    [{<<"content-type">>, <<"text/plain">>}], Body).
+
+drain_request_body(StreamId, Acc) ->
+    receive
+        {h1_stream, StreamId, {data, Chunk, true}} ->
+            Acc + byte_size(Chunk);
+        {h1_stream, StreamId, {data, Chunk, false}} ->
+            drain_request_body(StreamId, Acc + byte_size(Chunk));
+        {h1_stream, StreamId, {trailers, _}} ->
+            Acc
+    after 10000 -> Acc
     end.
 
 %% ----------------------------------------------------------------------------
@@ -364,6 +391,31 @@ early_response_lingering_timeout_alias(_Config) ->
         h1:stop_server(Ref)
     end.
 
+%% A server whose max_body_size is raised above the 8 MB default accepts a
+%% content-length body larger than the default.
+max_body_size_raised_content_length(_Config) ->
+    Cap = 32 * 1024 * 1024,
+    Size = 20 * 1024 * 1024,
+    ?assertEqual(Size, body_cap_probe(Cap, Size, content_length)).
+
+%% Same, framed as a single chunked body: the raised cap admits a chunk
+%% whose declared size exceeds the default.
+max_body_size_raised_chunked(_Config) ->
+    Cap = 32 * 1024 * 1024,
+    Size = 20 * 1024 * 1024,
+    ?assertEqual(Size, body_cap_probe(Cap, Size, chunked)).
+
+%% max_body_size => infinity disables the cap entirely.
+max_body_size_infinity(_Config) ->
+    Size = 20 * 1024 * 1024,
+    ?assertEqual(Size, body_cap_probe(infinity, Size, content_length)).
+
+%% Without the option the 8 MB default still applies: a 20 MB body is
+%% rejected and the connection closes without a 200.
+max_body_size_default_rejects(_Config) ->
+    Size = 20 * 1024 * 1024,
+    ?assertEqual(rejected, body_cap_probe(default, Size, content_length)).
+
 get_tls(Config0) ->
     {CertFile, KeyFile} = make_selfsigned_cert(?config(priv_dir, Config0)),
     Opts = #{transport => ssl,
@@ -403,6 +455,48 @@ start_tcp_server(Handler, Config) ->
     Opts = #{transport => tcp, handler => Handler, acceptors => 1},
     {ok, Ref} = h1:start_server(0, Opts),
     [{server_ref, Ref} | Config].
+
+%% Start a server with the given max_body_size (`default' omits the option),
+%% POST a `Size'-byte body framed as `content_length' or `chunked', and return
+%% the echoed byte count on success or `rejected' if the server refused the
+%% body and closed the connection.
+body_cap_probe(Cap, Size, Framing) ->
+    %% h1:connect links the client connection to us; when the server rejects
+    %% the body and closes, that connection exits {shutdown, peer_closed}.
+    %% Trap exits so the signal arrives as a message instead of killing the
+    %% test process; the {closed, _} owner event still reports the rejection.
+    process_flag(trap_exit, true),
+    Opts0 = #{transport => tcp, handler => fun count_body_handler/5,
+              acceptors => 1},
+    Opts = case Cap of
+        default -> Opts0;
+        _       -> Opts0#{max_body_size => Cap}
+    end,
+    {ok, Ref} = h1:start_server(0, Opts),
+    try
+        Port = h1:server_port(Ref),
+        {ok, Conn} = h1:connect("127.0.0.1", Port, #{transport => tcp}),
+        Body = binary:copy(<<"x">>, Size),
+        Headers = case Framing of
+            content_length ->
+                [{<<"host">>, <<"localhost">>},
+                 {<<"content-length">>, integer_to_binary(Size)}];
+            chunked ->
+                [{<<"host">>, <<"localhost">>}]
+        end,
+        Result = case h1:request(Conn, <<"POST">>, <<"/upload">>, Headers, Body) of
+            {ok, Id} ->
+                case collect_response(Conn, Id) of
+                    {200, _Hs, Echo} -> binary_to_integer(Echo);
+                    {_Other, _, _}   -> rejected
+                end;
+            {error, _} -> rejected
+        end,
+        h1:close(Conn),
+        Result
+    after
+        h1:stop_server(Ref)
+    end.
 
 %% Start a server with a small body cap, drive a POST whose body is sent in
 %% two parts: a small first chunk that reaches the handler, then a large
@@ -452,8 +546,14 @@ send_head_and_first_chunk(Port, Total, First) ->
 %% the status. Returns {ok, Status} or {error, Reason}. The client sends the
 %% whole body before reading, exposing the early-response/socket-close race.
 paced_upload_once(Port, Total, Chunk, SleepMs) ->
-    Sock = send_head_and_first_chunk(Port, Total, Chunk),
-    _ = send_paced(Sock, Total - Chunk, Chunk, SleepMs),
+    %% Send a small first chunk (under the listener's max_body_size) so the
+    %% handler receives it and early-responds, then let the connection enter
+    %% lingering close before pacing the large remainder. Those bytes are
+    %% drained raw, so the remainder can exceed the cap without tripping it.
+    First = 1024,
+    Sock = send_head_and_first_chunk(Port, Total, First),
+    timer:sleep(200),
+    _ = send_paced(Sock, Total - First, Chunk, SleepMs),
     Result = try recv_http_response(Sock) of
         {Status, _Hdrs, _Body} -> {ok, Status}
     catch

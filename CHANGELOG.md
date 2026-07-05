@@ -4,6 +4,17 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] - 2026-07-05
+
+### Fixed
+
+- `start_server/2,3` now forwards `max_body_size` to the connection. The option
+  was documented as a listener option and accepted by the parser, but
+  `spawn_listener/4` dropped it from the connection opts, so a server was always
+  capped at the 8 MB default and could not raise or disable it. Bodies over 8 MB
+  failed with `body_too_large` and closed the socket regardless of the
+  configured value.
+
 ## [0.7.0] - 2026-06-15
 
 ### Fixed
