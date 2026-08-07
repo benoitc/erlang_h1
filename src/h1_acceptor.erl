@@ -22,7 +22,8 @@
                   listen_socket := term(),
                   handler := term(),
                   conn_opts := map(),
-                  server_opts := map()}.
+                  server_opts := map(),
+                  listener := pid()}.
 
 -spec start_link(args()) -> {ok, pid()}.
 start_link(Args) ->
@@ -55,12 +56,18 @@ accept(ssl, ListenSocket) ->
 spawn_connection(Socket, #{transport := Transport,
                            handler := Handler,
                            conn_opts := ConnOpts,
-                           server_opts := ServerOpts}) ->
+                           server_opts := ServerOpts,
+                           listener := Listener}) ->
     Parent = self(),
+    ServerOpts1 = ServerOpts#{listener => Listener},
     Pid = erlang:spawn(fun() ->
         h1_server:init_accepted(Parent, Socket, Transport,
-                                Handler, ConnOpts, ServerOpts)
+                                Handler, ConnOpts, ServerOpts1)
     end),
+    %% Register with the listener before the socket handoff so a
+    %% concurrent stop cannot miss this connection: the listener kills
+    %% the acceptors and drains these messages before closing anything.
+    Listener ! {h1_conn_started, Pid},
     case controlling_process(Transport, Socket, Pid) of
         ok ->
             Pid ! {h1_acceptor, socket_ready},

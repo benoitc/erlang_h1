@@ -4,6 +4,34 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-08-07
+
+### Added
+
+- `h1:peername/1`: address and port of the connected peer, recorded when the
+  connection starts. Works on server and client connections.
+- `h1:send_informational/4`: interim (1xx) responses, e.g. 103 Early Hints,
+  ahead of the final response. Callable several times per stream; rejects 101
+  (the Upgrade path), calls after the final response headers, and HTTP/1.0
+  clients (RFC 9110 §15.2).
+- `h1:stop_accepting/1`: close the listen socket and acceptor pool while
+  continuing to serve established connections (graceful drain). Synchronous.
+
+### Changed
+
+- `h1:stop_server/1` is now synchronous and closes accepted connections. The
+  listener tracks every accepted connection; stop closes the listen socket,
+  the acceptors, and each connection (kept-alive and in-flight included)
+  before returning. Previously only the listen socket and acceptors were
+  closed, so kept-alive clients were still served by a stopped server.
+
+### Fixed
+
+- Client: bytes buffered behind an interim (1xx) response are no longer
+  dropped when the response parser is reset. A segment carrying several 1xx
+  responses, or a 1xx and the final response together, is now fully parsed;
+  previously everything after the first 1xx in the segment was lost.
+
 ## [0.7.1] - 2026-07-05
 
 ### Fixed

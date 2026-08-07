@@ -30,7 +30,15 @@
     max_body_size_infinity/1,
     max_body_size_default_rejects/1,
     get_tls/1,
-    server_stop_is_clean/1
+    server_stop_is_clean/1,
+    peername_tcp/1,
+    peername_tls/1,
+    informational_early_hints/1,
+    informational_rejects_invalid/1,
+    informational_rejects_http_1_0/1,
+    informational_rejects_mid_response/1,
+    stop_closes_keepalive/1,
+    stop_accepting_keeps_serving/1
 ]).
 
 all() ->
@@ -42,10 +50,14 @@ all() ->
             early_response_lingering_timeout_alias,
             max_body_size_raised_content_length, max_body_size_raised_chunked,
             max_body_size_infinity, max_body_size_default_rejects,
-            server_stop_is_clean],
+            server_stop_is_clean,
+            peername_tcp, informational_early_hints,
+            informational_rejects_invalid, informational_rejects_http_1_0,
+            informational_rejects_mid_response,
+            stop_closes_keepalive, stop_accepting_keeps_serving],
     case os:find_executable("openssl") of
         false -> Base;
-        _ -> Base ++ [get_tls]
+        _ -> Base ++ [get_tls, peername_tls]
     end.
 
 init_per_suite(Config) ->
@@ -110,6 +122,23 @@ trailer_handler(Conn, StreamId, _M, _P, _H) ->
                            {<<"trailer">>, <<"x-checksum">>}]),
     ok = h1:send_data(Conn, StreamId, <<"body">>, false),
     ok = h1:send_trailers(Conn, StreamId, [{<<"x-checksum">>, <<"deadbeef">>}]).
+
+%% Echo the connection's view of the client address so the test can
+%% compare it against the client socket's sockname.
+peer_handler(Conn, StreamId, _M, _P, _H) ->
+    Body = case h1:peername(Conn) of
+        {ok, {IP, Port}} -> peer_binary(IP, Port);
+        {error, R} -> iolist_to_binary(io_lib:format("error:~p", [R]))
+    end,
+    ok = h1:respond(Conn, StreamId, 200,
+                    [{<<"content-type">>, <<"text/plain">>}], Body).
+
+early_hints_handler(Conn, StreamId, _M, _P, _H) ->
+    ok = h1:send_informational(Conn, StreamId, 103,
+        [{<<"link">>, <<"</style.css>; rel=preload; as=style">>}]),
+    ok = h1:send_informational(Conn, StreamId, 103,
+        [{<<"link">>, <<"</app.js>; rel=preload; as=script">>}]),
+    ok = h1:respond(Conn, StreamId, 200, [], <<"hinted">>).
 
 %% respond/5 sends status + headers + body in one write, adding
 %% Content-Length and ending the stream.
@@ -447,6 +476,154 @@ server_stop_is_clean(Config0) ->
                                              [binary, {active, false}], 500)),
     {save_config, lists:keydelete(server_ref, 1, Config)}.
 
+%% The handler observes the client's address; the raw client compares it
+%% against its own sockname.
+peername_tcp(Config0) ->
+    Config = start_tcp_server(fun peer_handler/5, Config0),
+    Port = h1:server_port(?config(server_ref, Config)),
+    {ok, Sock} = gen_tcp:connect("127.0.0.1", Port,
+                                 [binary, {active, false}, {packet, raw}]),
+    ok = gen_tcp:send(Sock, <<"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n">>),
+    {200, _, Body} = recv_http_response(Sock),
+    {ok, {IP, LPort}} = inet:sockname(Sock),
+    ?assertEqual(peer_binary(IP, LPort), Body),
+    gen_tcp:close(Sock),
+    {save_config, Config}.
+
+peername_tls(Config0) ->
+    {CertFile, KeyFile} = make_selfsigned_cert(?config(priv_dir, Config0)),
+    Opts = #{transport => ssl, cert => CertFile, key => KeyFile,
+             handler => fun peer_handler/5, acceptors => 1},
+    {ok, Ref} = h1:start_server(0, Opts),
+    Config = [{server_ref, Ref} | Config0],
+    Port = h1:server_port(Ref),
+    {ok, Sock} = ssl:connect("localhost", Port,
+                             [binary, {active, false}, {packet, raw},
+                              {verify, verify_none}], 5000),
+    ok = ssl:send(Sock, <<"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n">>),
+    Resp = ssl_recv_all(Sock, <<>>),
+    {ok, {IP, LPort}} = ssl:sockname(Sock),
+    Expected = peer_binary(IP, LPort),
+    ?assertMatch({_, _}, binary:match(Resp, Expected)),
+    _ = ssl:close(Sock),
+    {save_config, Config}.
+
+%% Two 103 Early Hints ahead of the final 200, observed by the h1 client
+%% as {informational, _} events in order.
+informational_early_hints(Config0) ->
+    Config = start_tcp_server(fun early_hints_handler/5, Config0),
+    Port = h1:server_port(?config(server_ref, Config)),
+    {ok, Conn} = h1:connect("127.0.0.1", Port, #{transport => tcp}),
+    {ok, Id} = h1:request(Conn, <<"GET">>, <<"/">>,
+                          [{<<"host">>, <<"localhost">>}]),
+    {Infos, {Status, _Hs, Body}} = collect_with_informational(Conn, Id),
+    ?assertEqual(200, Status),
+    ?assertEqual(<<"hinted">>, Body),
+    ?assertMatch([{103, _}, {103, _}], Infos),
+    [{103, Hs1}, {103, Hs2}] = Infos,
+    ?assertEqual(<<"</style.css>; rel=preload; as=style">>,
+                 proplists:get_value(<<"link">>, Hs1)),
+    ?assertEqual(<<"</app.js>; rel=preload; as=script">>,
+                 proplists:get_value(<<"link">>, Hs2)),
+    h1:close(Conn),
+    {save_config, Config}.
+
+%% 101 and out-of-range statuses are rejected before anything is written.
+informational_rejects_invalid(Config0) ->
+    TestPid = self(),
+    Handler = fun(Conn, Id, _M, _P, _H) ->
+        R101 = h1:send_informational(Conn, Id, 101, []),
+        R200 = h1:send_informational(Conn, Id, 200, []),
+        TestPid ! {inform_results, R101, R200},
+        ok = h1:respond(Conn, Id, 200, [], <<"ok">>)
+    end,
+    Config = start_tcp_server(Handler, Config0),
+    Port = h1:server_port(?config(server_ref, Config)),
+    {200, _, <<"ok">>} = simple_get(Port),
+    receive
+        {inform_results, R101, R200} ->
+            ?assertEqual({error, invalid_informational_status}, R101),
+            ?assertEqual({error, invalid_informational_status}, R200)
+    after 5000 -> ct:fail(no_inform_results)
+    end,
+    {save_config, Config}.
+
+%% RFC 9110 §15.2: no 1xx to an HTTP/1.0 client.
+informational_rejects_http_1_0(Config0) ->
+    Handler = fun(Conn, Id, _M, _P, _H) ->
+        Body = case h1:send_informational(Conn, Id, 103, []) of
+            {error, http_1_0} -> <<"rejected">>;
+            Other -> iolist_to_binary(io_lib:format("~p", [Other]))
+        end,
+        ok = h1:respond(Conn, Id, 200, [], Body)
+    end,
+    Config = start_tcp_server(Handler, Config0),
+    Port = h1:server_port(?config(server_ref, Config)),
+    {ok, Sock} = gen_tcp:connect("127.0.0.1", Port,
+                                 [binary, {active, false}, {packet, raw}]),
+    ok = gen_tcp:send(Sock, <<"GET / HTTP/1.0\r\n\r\n">>),
+    {200, _, Body} = recv_http_response(Sock),
+    ?assertEqual(<<"rejected">>, Body),
+    gen_tcp:close(Sock),
+    {save_config, Config}.
+
+%% Once the final response headers went out, interim sends are refused.
+informational_rejects_mid_response(Config0) ->
+    TestPid = self(),
+    Handler = fun(Conn, Id, _M, _P, _H) ->
+        ok = h1:send_response(Conn, Id, 200,
+                              [{<<"transfer-encoding">>, <<"chunked">>}]),
+        RMid = h1:send_informational(Conn, Id, 103, []),
+        TestPid ! {mid_result, RMid},
+        ok = h1:send_data(Conn, Id, <<"x">>, true)
+    end,
+    Config = start_tcp_server(Handler, Config0),
+    Port = h1:server_port(?config(server_ref, Config)),
+    {200, _, _} = simple_get(Port),
+    receive
+        {mid_result, RMid} ->
+            ?assertEqual({error, response_already_started}, RMid)
+    after 5000 -> ct:fail(no_mid_result)
+    end,
+    {save_config, Config}.
+
+%% stop_server/1 must close accepted (kept-alive) connections, not just
+%% the listen socket, and return only once it has.
+stop_closes_keepalive(Config0) ->
+    Opts = #{transport => tcp, handler => fun echo_handler/5, acceptors => 1},
+    {ok, Ref} = h1:start_server(0, Opts),
+    Port = h1:server_port(Ref),
+    {ok, Sock} = gen_tcp:connect("127.0.0.1", Port,
+                                 [binary, {active, false}, {packet, raw}]),
+    ok = gen_tcp:send(Sock, <<"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n">>),
+    {200, _, <<"hello world">>} = recv_http_response(Sock),
+    ok = h1:stop_server(Ref),
+    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 2000)),
+    ?assertMatch({error, _}, gen_tcp:connect("127.0.0.1", Port,
+                                             [binary, {active, false}], 500)),
+    gen_tcp:close(Sock),
+    {save_config, Config0}.
+
+%% stop_accepting/1 refuses new connections but keeps serving the
+%% established ones until stop_server/1.
+stop_accepting_keeps_serving(Config0) ->
+    Opts = #{transport => tcp, handler => fun echo_handler/5, acceptors => 2},
+    {ok, Ref} = h1:start_server(0, Opts),
+    Port = h1:server_port(Ref),
+    {ok, Sock} = gen_tcp:connect("127.0.0.1", Port,
+                                 [binary, {active, false}, {packet, raw}]),
+    ok = gen_tcp:send(Sock, <<"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n">>),
+    {200, _, _} = recv_http_response(Sock),
+    ok = h1:stop_accepting(Ref),
+    ?assertMatch({error, _}, gen_tcp:connect("127.0.0.1", Port,
+                                             [binary, {active, false}], 500)),
+    ok = gen_tcp:send(Sock, <<"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n">>),
+    {200, _, <<"hello world">>} = recv_http_response(Sock),
+    ok = h1:stop_server(Ref),
+    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 2000)),
+    gen_tcp:close(Sock),
+    {save_config, Config0}.
+
 %% ----------------------------------------------------------------------------
 %% Helpers
 %% ----------------------------------------------------------------------------
@@ -619,6 +796,39 @@ parse_header(Line) ->
 
 header(Name, Hdrs) ->
     proplists:get_value(Name, Hdrs).
+
+peer_binary(IP, Port) ->
+    iolist_to_binary([inet:ntoa(IP), $:, integer_to_binary(Port)]).
+
+simple_get(Port) ->
+    {ok, Sock} = gen_tcp:connect("127.0.0.1", Port,
+                                 [binary, {active, false}, {packet, raw}]),
+    ok = gen_tcp:send(Sock, <<"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n">>),
+    Resp = recv_http_response(Sock),
+    gen_tcp:close(Sock),
+    Resp.
+
+ssl_recv_all(Sock, Acc) ->
+    case ssl:recv(Sock, 0, 2000) of
+        {ok, Data} -> ssl_recv_all(Sock, <<Acc/binary, Data/binary>>);
+        {error, _} -> Acc
+    end.
+
+%% As collect_response/2, but returns the interim responses seen before
+%% the final one, in order.
+collect_with_informational(Conn, Id) ->
+    collect_with_informational(Conn, Id, []).
+
+collect_with_informational(Conn, Id, Infos) ->
+    receive
+        {h1, Conn, {informational, Id, S, H}} ->
+            collect_with_informational(Conn, Id, [{S, H} | Infos]);
+        {h1, Conn, {response, Id, S, H}} ->
+            {Status, Hs, Body} = collect_response(Conn, Id, S, H, <<>>),
+            {lists:reverse(Infos), {Status, Hs, Body}}
+    after 5000 ->
+        ct:fail({informational_timeout, Infos})
+    end.
 
 collect_response(Conn, Id) ->
     collect_response(Conn, Id, undefined, [], <<>>).

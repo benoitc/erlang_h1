@@ -83,8 +83,10 @@ h1:controlling_process/2
 %% Server
 h1:start_server/2,3
 h1:stop_server/1
+h1:stop_accepting/1
 h1:server_port/1
 h1:send_response/4
+h1:send_informational/4
 
 %% HTTP/1.1-specific
 h1:upgrade/3,4
@@ -96,6 +98,7 @@ h1:pipeline/2
 %% Inspection
 h1:get_settings/1
 h1:get_peer_settings/1
+h1:peername/1
 ```
 
 The export list mirrors `h2` and `quic_h3` where semantics overlap. H1-specific primitives (`upgrade`, `accept_upgrade`, `continue`, `pipeline`) cover what h2 and h3 have no equivalent of.
