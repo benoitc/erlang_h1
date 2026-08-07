@@ -34,8 +34,10 @@
 -export([request/2, request/3, request/4, request/5]).
 
 %% Server API
--export([start_server/2, start_server/3, stop_server/1, server_port/1]).
+-export([start_server/2, start_server/3, stop_server/1, stop_accepting/1,
+         server_port/1]).
 -export([send_response/4, respond/5, respond/6]).
+-export([send_informational/4]).
 
 %% Common API
 -export([send_data/3, send_data/4]).
@@ -46,6 +48,7 @@
 -export([goaway/1, goaway/2]).
 -export([close/1]).
 -export([get_settings/1, get_peer_settings/1]).
+-export([peername/1]).
 -export([controlling_process/2]).
 
 %% HTTP/1.1-specific
@@ -269,10 +272,20 @@ spawn_listener(Transport, ListenSocket, Bound, Opts) ->
 close_listen(gen_tcp, S) -> _ = gen_tcp:close(S), ok;
 close_listen(ssl, S) -> _ = ssl:close(S), ok.
 
+%% @doc Stop a server. Synchronous: closes the listen socket, the
+%% acceptor pool, and every accepted connection (kept-alive and
+%% in-flight included) before returning.
 -spec stop_server(server_ref()) -> ok.
 stop_server({Pid, Ref, _Port} = ServerRef) ->
     erase_server_term(ServerRef),
     h1_listener:stop(Pid, Ref).
+
+%% @doc Stop accepting new connections while continuing to serve the
+%% established ones (graceful drain). Synchronous. Call
+%% `stop_server/1' afterwards to close the remaining connections.
+-spec stop_accepting(server_ref()) -> ok.
+stop_accepting({Pid, Ref, _Port}) ->
+    h1_listener:stop_accepting(Pid, Ref).
 
 %% Drop any name->ref registration made by start_server/3 so repeated
 %% start/stop cycles don't leak persistent_term entries.
@@ -381,6 +394,13 @@ get_settings(Conn) -> h1_connection:get_settings(Conn).
 -spec get_peer_settings(connection()) -> map().
 get_peer_settings(Conn) -> h1_connection:get_peer_settings(Conn).
 
+%% @doc Address and port of the connected peer. Works in both modes:
+%% the remote client on a server connection, the remote server on a
+%% client connection.
+-spec peername(connection()) ->
+    {ok, {inet:ip_address(), inet:port_number()}} | {error, term()}.
+peername(Conn) -> h1_connection:peername(Conn).
+
 -spec controlling_process(connection(), pid()) -> ok | {error, term()}.
 controlling_process(Conn, Pid) ->
     h1_connection:controlling_process(Conn, Pid).
@@ -430,6 +450,15 @@ accept_connect(Conn, StreamId, ExtraHeaders, Timeout) ->
 -spec continue(connection(), stream_id()) -> ok | {error, term()}.
 continue(Conn, StreamId) ->
     h1_connection:continue(Conn, StreamId).
+
+%% @doc Server: send an interim (1xx) response, e.g. 103 Early Hints,
+%% ahead of the final response. May be called several times per stream,
+%% until the final response headers are sent. 101 is rejected (use the
+%% Upgrade machinery), and so are HTTP/1.0 clients (RFC 9110 §15.2).
+-spec send_informational(connection(), stream_id(), 100..199, headers()) ->
+    ok | {error, term()}.
+send_informational(Conn, StreamId, Status, Headers) ->
+    h1_connection:send_informational(Conn, StreamId, Status, Headers).
 
 %% @doc Toggle request pipelining on a client connection.
 -spec pipeline(connection(), boolean()) -> ok | {error, term()}.

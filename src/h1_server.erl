@@ -28,21 +28,22 @@ handle_accepted(Socket, ssl, Handler, ConnOpts, ServerOpts) ->
     HandshakeTimeout = maps:get(handshake_timeout, ServerOpts, 30000),
     case ssl:handshake(Socket, HandshakeTimeout) of
         {ok, TlsSocket} ->
-            run_connection(TlsSocket, ssl, Handler, ConnOpts);
+            run_connection(TlsSocket, ssl, Handler, ConnOpts, ServerOpts);
         {error, _Reason} ->
             _ = ssl:close(Socket),
             ok
     end;
-handle_accepted(Socket, gen_tcp, Handler, ConnOpts, _ServerOpts) ->
-    run_connection(Socket, gen_tcp, Handler, ConnOpts).
+handle_accepted(Socket, gen_tcp, Handler, ConnOpts, ServerOpts) ->
+    run_connection(Socket, gen_tcp, Handler, ConnOpts, ServerOpts).
 
-run_connection(Socket, Transport, Handler, ConnOpts) ->
+run_connection(Socket, Transport, Handler, ConnOpts, ServerOpts) ->
     case h1_connection:start_link(server, Socket, self(), ConnOpts) of
         {ok, Conn} ->
             case transfer(Transport, Socket, Conn) of
                 ok ->
                     case h1_connection:activate(Conn) of
                         ok ->
+                            notify_listener(ServerOpts, Conn),
                             connection_loop(Conn, Handler);
                         {error, _} ->
                             try h1_connection:close(Conn) catch _:_ -> ok end
@@ -54,6 +55,14 @@ run_connection(Socket, Transport, Handler, ConnOpts) ->
         {error, _Reason} ->
             close(Transport, Socket)
     end.
+
+%% Tell the listener which h1_connection serves this loop, so stopping
+%% the server can close it (and its socket) synchronously.
+notify_listener(#{listener := Listener}, Conn) when is_pid(Listener) ->
+    Listener ! {h1_conn_up, self(), Conn},
+    ok;
+notify_listener(_, _Conn) ->
+    ok.
 
 transfer(gen_tcp, Socket, Pid) -> gen_tcp:controlling_process(Socket, Pid);
 transfer(ssl, Socket, Pid) -> ssl:controlling_process(Socket, Pid).

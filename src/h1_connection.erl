@@ -34,6 +34,8 @@
 -export([send_data/3, send_data/4]).
 -export([send_trailers/3]).
 -export([continue/2]).
+-export([send_informational/4]).
+-export([peername/1]).
 -export([upgrade/3, upgrade/4]).
 -export([accept_upgrade/3]).
 -export([accept_connect/3, accept_connect/4]).
@@ -212,6 +214,19 @@ send_trailers(Pid, StreamId, Trailers) ->
 continue(Pid, StreamId) ->
     gen_statem:call(Pid, {continue, StreamId}).
 
+%% @doc Server: emit an interim (1xx) response, e.g. 103 Early Hints,
+%% before the final response. May be called multiple times per stream.
+%% 101 is rejected (that is the Upgrade path), as is any call after the
+%% final response headers went out, or to an HTTP/1.0 client (RFC 9110
+%% §15.2 forbids 1xx to HTTP/1.0).
+send_informational(Pid, StreamId, Status, Headers) ->
+    gen_statem:call(Pid, {send_informational, StreamId, Status, Headers}).
+
+%% @doc Address and port of the connected peer, recorded when the
+%% connection process started.
+peername(Pid) ->
+    gen_statem:call(Pid, peername).
+
 %% @doc Client: send an Upgrade request and block until either 101 arrives
 %% (returning the raw socket) or a non-101 response is received.
 upgrade(Pid, Protocol, Headers) ->
@@ -302,12 +317,17 @@ init({Mode, Socket, Owner, Opts}) ->
         H when is_binary(H) -> H;
         H when is_list(H)   -> iolist_to_binary(H)
     end,
+    Peer = case sock_peername(Transport, Socket) of
+        {ok, P} -> P;
+        {error, _} -> undefined
+    end,
     State = #state{
         mode = Mode,
         socket = Socket,
         transport = Transport,
         owner = Owner,
         owner_ref = Ref,
+        peer = Peer,
         peer_host = PeerHost,
         parser = Parser,
         parser_opts = ParserOpts,
@@ -482,6 +502,11 @@ handle_event({call, From}, {continue, StreamId}, open,
     handle_continue(From, StreamId, State);
 handle_event({call, From}, {continue, _StreamId}, _, _State) ->
     {keep_state_and_data, [{reply, From, {error, not_server}}]};
+handle_event({call, From}, {send_informational, StreamId, Status, Headers}, open,
+             #state{mode = server} = State) ->
+    handle_send_informational(From, StreamId, Status, Headers, State);
+handle_event({call, From}, {send_informational, _, _, _}, _, _State) ->
+    {keep_state_and_data, [{reply, From, {error, not_server}}]};
 
 %% --- upgrade ---------------------------------------------------------------
 
@@ -538,6 +563,11 @@ handle_event({call, From}, {controlling_process, NewOwner}, _S, State) ->
     NewRef = erlang:monitor(process, NewOwner),
     {keep_state, State#state{owner = NewOwner, owner_ref = NewRef},
      [{reply, From, ok}]};
+
+handle_event({call, From}, peername, _S, #state{peer = undefined}) ->
+    {keep_state_and_data, [{reply, From, {error, closed}}]};
+handle_event({call, From}, peername, _S, #state{peer = Peer}) ->
+    {keep_state_and_data, [{reply, From, {ok, Peer}}]};
 
 handle_event({call, From}, get_settings, _S, _State) ->
     {keep_state_and_data, [{reply, From, #{}}]};
@@ -598,6 +628,9 @@ set_active_false(#state{socket = S, transport = ssl} = St) ->
 
 sock_send(#state{transport = gen_tcp, socket = S}, Data) -> gen_tcp:send(S, Data);
 sock_send(#state{transport = ssl,    socket = S}, Data) -> ssl:send(S, Data).
+
+sock_peername(gen_tcp, S) -> inet:peername(S);
+sock_peername(ssl, S)     -> ssl:peername(S).
 
 close_socket(gen_tcp, S) -> gen_tcp:close(S);
 close_socket(ssl, S)     -> ssl:close(S).
@@ -697,6 +730,12 @@ drive_parser({headers_complete, P}, State, Mode) ->
     case on_headers_complete(State1, Mode) of
         {continue, State2} ->
             drive_parser(h1_parse_erl:execute(State2#state.parser), State2, Mode);
+        {continue_buffer, Data, State2} ->
+            %% The parser was reset after an interim (1xx) response;
+            %% re-feed the bytes it had already buffered (the rest of a
+            %% segment carrying several 1xx and/or the final response).
+            drive_parser(h1_parse_erl:execute(State2#state.parser, Data),
+                         State2, Mode);
         {pause, State2}    -> {ok, State2};
         {upgrade_client, Stream, Parser, State2} ->
             {upgrade_client, Stream, Parser, State2}
@@ -779,7 +818,7 @@ on_headers_complete(#state{mode = client, current_stream = Id} = State, client) 
             State1 = maybe_flush_pending_body(Id, put_stream(Stream2, State)),
             notify(State1#state.owner,
                    {informational, Id, Status, Headers}, self()),
-            {continue, reset_parser_for_response(State1, Id)};
+            continue_after_informational(State1, Id);
         101 ->
             {upgrade_client, Stream1, State#state.parser, put_stream(Stream1, State)};
         _ when Status >= 100, Status =< 199 ->
@@ -787,7 +826,7 @@ on_headers_complete(#state{mode = client, current_stream = Id} = State, client) 
             State1 = put_stream(Stream2, State),
             notify(State1#state.owner,
                    {informational, Id, Status, Headers}, self()),
-            {continue, reset_parser_for_response(State1, Id)};
+            continue_after_informational(State1, Id);
         _ ->
             State1 = put_stream(Stream1, State),
             _ = emit_to_owner_or_handler_lookup(Id,
@@ -1033,6 +1072,19 @@ reset_parser(#state{mode = client, parser_opts = Opts, pending = Q, streams = St
 
 reset_parser_for_response(State, Id) ->
     State#state{parser = reset_parser(State), current_stream = Id}.
+
+%% After an interim (1xx) response the parser is reset for the next
+%% response on the same stream. Bytes it had already consumed into its
+%% buffer (a following 1xx or the final response in the same segment)
+%% must be re-fed to the fresh parser or they are silently dropped.
+continue_after_informational(State, Id) ->
+    Buffer = h1_parse_erl:get(State#state.parser, buffer),
+    State1 = reset_parser_for_response(State, Id),
+    case Buffer of
+        <<>> -> {continue, State1};
+        undefined -> {continue, State1};
+        _ -> {continue_buffer, Buffer, State1}
+    end.
 
 %% ----------------------------------------------------------------------------
 %% Client: send_request
@@ -1404,6 +1456,40 @@ handle_send_trailers(From, StreamId, Trailers, State) ->
         {ok, _} ->
             {keep_state_and_data,
              [{reply, From, {error, trailers_require_chunked}}]};
+        error ->
+            {keep_state_and_data, [{reply, From, {error, unknown_stream}}]}
+    end.
+
+%% Interim (1xx) response ahead of the final one. 101 is carved out for
+%% the Upgrade machinery, and HTTP/1.0 clients must not see 1xx at all
+%% (RFC 9110 §15.2). Writing is only legal while the final response
+%% headers have not been committed (`#stream.status' is set by
+%% send_response/respond).
+handle_send_informational(From, _StreamId, Status, _Headers, _State)
+  when Status < 100; Status > 199; Status =:= 101 ->
+    {keep_state_and_data, [{reply, From, {error, invalid_informational_status}}]};
+handle_send_informational(From, StreamId, Status, Headers, State) ->
+    case maps:find(StreamId, State#state.streams) of
+        {ok, #stream{version = ?HTTP_1_0}} ->
+            {keep_state_and_data, [{reply, From, {error, http_1_0}}]};
+        {ok, #stream{status = undefined} = Stream} ->
+            Wire = [h1_message:status_line(Status, ?HTTP_1_1),
+                    h1_message:headers(Headers),
+                    <<"\r\n">>],
+            case sock_send(State, Wire) of
+                ok ->
+                    Stream1 = case Status of
+                        100 -> Stream#stream{continue_sent = true};
+                        _ -> Stream
+                    end,
+                    {keep_state, put_stream(Stream1, State),
+                     [{reply, From, ok}]};
+                {error, R} ->
+                    {keep_state_and_data, [{reply, From, {error, R}}]}
+            end;
+        {ok, _} ->
+            {keep_state_and_data,
+             [{reply, From, {error, response_already_started}}]};
         error ->
             {keep_state_and_data, [{reply, From, {error, unknown_stream}}]}
     end.
