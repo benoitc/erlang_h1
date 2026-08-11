@@ -10,8 +10,29 @@
 -module(h1_server).
 
 -export([init_accepted/6]).
+-export([init_serve/5]).
 
 -type transport() :: gen_tcp | ssl.
+
+%% @doc Serve a socket the caller already accepted (and, for TLS, already
+%% handshaked). Waits for `h1:serve_socket/2' to transfer socket ownership,
+%% then runs the same connection loop as an accepted connection — no
+%% handshake, no listener registration.
+-spec init_serve(term(), transport(), term(), map(), map()) -> ok.
+init_serve(Socket, Transport, Handler, ConnOpts, ServerOpts) ->
+    %% Linked to the caller (h1:serve_socket/2) and to the h1_connection.
+    %% Trap exits so a connection that stops with `{shutdown, peer_closed}'
+    %% ends this loop quietly instead of taking the caller down with it;
+    %% the caller's own exit is handled in connection_loop/2.
+    process_flag(trap_exit, true),
+    receive
+        {h1_server, socket_ready} ->
+            run_connection(Socket, Transport, Handler, ConnOpts, ServerOpts);
+        {h1_server, transfer_failed} ->
+            ok
+    after 5000 ->
+        close(Transport, Socket)
+    end.
 
 -spec init_accepted(pid(), term(), transport(), term(), map(), map()) -> ok.
 init_accepted(_Parent, Socket, Transport, Handler, ConnOpts, ServerOpts) ->
@@ -102,9 +123,17 @@ connection_loop(Conn, Handler) ->
             ok;
         {'EXIT', Conn, _Reason} ->
             ok;
+        {'EXIT', _Other, _Reason} ->
+            %% The only other process this loop is linked to is the caller of
+            %% `h1:serve_socket/2'. It is gone, so take the connection with it.
+            close_connection(Conn);
         _Other ->
             connection_loop(Conn, Handler)
     end.
+
+close_connection(Conn) ->
+    try h1_connection:close(Conn) catch _:_ -> ok end,
+    ok.
 
 pump(Conn, Handler, Pid, MRef, StreamId) ->
     receive
@@ -126,7 +155,12 @@ pump(Conn, Handler, Pid, MRef, StreamId) ->
             ok;
         {'EXIT', Conn, Reason} ->
             Pid ! {h1_stream, StreamId, {stream_reset, Reason}},
-            ok
+            ok;
+        {'EXIT', _Other, Reason} ->
+            %% Caller of `h1:serve_socket/2' gone mid-stream: unblock the
+            %% handler, then close the connection.
+            Pid ! {h1_stream, StreamId, {stream_reset, Reason}},
+            close_connection(Conn)
     end.
 
 start_handler(Conn, StreamId, Method, Path, Headers, Handler) ->

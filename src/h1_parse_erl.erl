@@ -58,6 +58,7 @@
 
 -type parser_option() :: request | response | auto
                        | {max_line_length, pos_integer()}
+                       | {max_request_line_size, pos_integer() | infinity}
                        | {max_empty_lines, non_neg_integer()}
                        | {max_header_name_size, pos_integer()}
                        | {max_header_value_size, pos_integer()}
@@ -106,6 +107,10 @@ apply_options([request | R], St) -> apply_options(R, St#h1_parser{type = request
 apply_options([response | R], St) -> apply_options(R, St#h1_parser{type = response});
 apply_options([{max_line_length, N} | R], St) when is_integer(N), N > 0 ->
     apply_options(R, St#h1_parser{max_line_length = N});
+apply_options([{max_request_line_size, N} | R], St) when is_integer(N), N > 0 ->
+    apply_options(R, St#h1_parser{max_request_line_size = N});
+apply_options([{max_request_line_size, infinity} | R], St) ->
+    apply_options(R, St#h1_parser{max_request_line_size = infinity});
 apply_options([{max_empty_lines, N} | R], St) when is_integer(N), N >= 0 ->
     apply_options(R, St#h1_parser{max_empty_lines = N});
 apply_options([{max_header_name_size, N} | R], St) when is_integer(N), N > 0 ->
@@ -181,8 +186,14 @@ execute(#h1_parser{state = State, buffer = Buf} = St, Bin) ->
 %% dripping one empty line per packet).
 parse_first_line(<<$\n, Rest/binary>>, St, _Empty) ->
     bump_empty_line(Rest, St);
-parse_first_line(Buf, #h1_parser{max_line_length = Max} = St, _Empty) ->
+parse_first_line(Buf, #h1_parser{max_line_length = Max,
+                                 max_request_line_size = MaxReq,
+                                 type = Type} = St, _Empty) ->
+    %% `infinity' compares greater than any integer in Erlang term order,
+    %% so an unset cap simply never trips these guards.
     case match_eol(Buf, 0) of
+        nomatch when Type =:= request, byte_size(Buf) > MaxReq ->
+            {error, request_line_too_long};
         nomatch when byte_size(Buf) > Max ->
             {error, line_too_long};
         nomatch ->
@@ -252,6 +263,21 @@ parse_uri_path(<<C, Rest/binary>>, St, Method, Acc) ->
 parse_version(<<"HTTP/", Hi, ".", Lo, Rest0/binary>>, St, Method, URI)
     when Hi >= $0, Hi =< $9, Lo >= $0, Lo =< $9 ->
     Version = {Hi - $0, Lo - $0},
+    %% Total request-line check, once the whole line is known. The method
+    %% and target scans above cap their own pieces first, so an over-long
+    %% target still reports `uri_too_long' rather than this.
+    case request_line_size(Method, URI) > St#h1_parser.max_request_line_size of
+        true -> {error, request_line_too_long};
+        false -> parse_version_done(Version, Rest0, St, Method, URI)
+    end;
+parse_version(_, _, _, _) ->
+    {error, bad_request}.
+
+%% method + SP + target + SP + "HTTP/x.y"
+request_line_size(Method, URI) ->
+    byte_size(Method) + byte_size(URI) + 10.
+
+parse_version_done(Version, Rest0, St, Method, URI) ->
     case strip_crlf(Rest0) of
         {ok, Rest} ->
             NSt = St#h1_parser{type = request,
@@ -263,9 +289,7 @@ parse_version(<<"HTTP/", Hi, ".", Lo, Rest0/binary>>, St, Method, URI)
             {request, Method, URI, Version, NSt};
         error ->
             {error, bad_request}
-    end;
-parse_version(_, _, _, _) ->
-    {error, bad_request}.
+    end.
 
 strip_crlf(<<"\r\n", Rest/binary>>) -> {ok, Rest};
 strip_crlf(<<"\n", Rest/binary>>)   -> {ok, Rest};
