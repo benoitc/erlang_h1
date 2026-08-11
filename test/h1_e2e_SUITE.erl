@@ -29,7 +29,14 @@
     max_body_size_raised_chunked/1,
     max_body_size_infinity/1,
     max_body_size_default_rejects/1,
+    limit_request_line_414/1,
+    limit_header_block_431/1,
+    limit_max_headers_431/1,
+    limit_body_size_413/1,
+    limit_conflicting_framing_400/1,
     get_tls/1,
+    tls_verify_peer_requires_cacerts/1,
+    tls_mutual_auth/1,
     server_stop_is_clean/1,
     peername_tcp/1,
     peername_tls/1,
@@ -50,6 +57,10 @@ all() ->
             early_response_lingering_timeout_alias,
             max_body_size_raised_content_length, max_body_size_raised_chunked,
             max_body_size_infinity, max_body_size_default_rejects,
+            limit_request_line_414, limit_header_block_431,
+            limit_max_headers_431, limit_body_size_413,
+            limit_conflicting_framing_400,
+            tls_verify_peer_requires_cacerts,
             server_stop_is_clean,
             peername_tcp, informational_early_hints,
             informational_rejects_invalid, informational_rejects_http_1_0,
@@ -57,7 +68,7 @@ all() ->
             stop_closes_keepalive, stop_accepting_keeps_serving],
     case os:find_executable("openssl") of
         false -> Base;
-        _ -> Base ++ [get_tls, peername_tls]
+        _ -> Base ++ [get_tls, peername_tls, tls_mutual_auth]
     end.
 
 init_per_suite(Config) ->
@@ -440,10 +451,98 @@ max_body_size_infinity(_Config) ->
     ?assertEqual(Size, body_cap_probe(infinity, Size, content_length)).
 
 %% Without the option the 8 MB default still applies: a 20 MB body is
-%% rejected and the connection closes without a 200.
+%% answered with 413 and the connection closes.
 max_body_size_default_rejects(_Config) ->
     Size = 20 * 1024 * 1024,
-    ?assertEqual(rejected, body_cap_probe(default, Size, content_length)).
+    ?assertEqual({rejected, 413}, body_cap_probe(default, Size, content_length)).
+
+%% ----------------------------------------------------------------------------
+%% Limits set through start_server/2 are answered, not just closed on
+%% ----------------------------------------------------------------------------
+
+%% A request line over max_request_line_size gets 414, not a bare close.
+limit_request_line_414(_Config) ->
+    Path = binary:copy(<<"x">>, 512),
+    Req = [<<"GET /">>, Path, <<" HTTP/1.1\r\nhost: localhost\r\n\r\n">>],
+    ?assertMatch({414, _, _},
+                 limit_probe(#{max_request_line_size => 256}, Req)).
+
+%% A header block over max_header_block_size gets 431.
+limit_header_block_431(_Config) ->
+    Hdrs = [[<<"x-pad-">>, integer_to_binary(N), <<": some-padding-value\r\n">>]
+            || N <- lists:seq(1, 50)],
+    Req = [<<"GET / HTTP/1.1\r\nhost: localhost\r\n">>, Hdrs, <<"\r\n">>],
+    {Status, RespHdrs, _} = limit_probe(#{max_header_block_size => 512}, Req),
+    ?assertEqual(431, Status),
+    ?assertEqual(<<"close">>, header(<<"connection">>, RespHdrs)).
+
+%% More header fields than max_headers gets 431 too.
+limit_max_headers_431(_Config) ->
+    Hdrs = [[<<"x-h-">>, integer_to_binary(N), <<": v\r\n">>]
+            || N <- lists:seq(1, 20)],
+    Req = [<<"GET / HTTP/1.1\r\nhost: localhost\r\n">>, Hdrs, <<"\r\n">>],
+    ?assertMatch({431, _, _}, limit_probe(#{max_headers => 5}, Req)).
+
+%% A body over max_body_size gets 413 while the handler is still waiting for
+%% the rest of it.
+limit_body_size_413(_Config) ->
+    Body = binary:copy(<<"x">>, 8192),
+    Req = [<<"POST /upload HTTP/1.1\r\nhost: localhost\r\n",
+             "content-length: 8192\r\n\r\n">>, Body],
+    {Status, RespHdrs, _} = limit_probe(#{max_body_size => 1024}, Req),
+    ?assertEqual(413, Status),
+    ?assertEqual(<<"close">>, header(<<"connection">>, RespHdrs)).
+
+%% The request-smuggling guard answers 400 rather than closing silently.
+limit_conflicting_framing_400(_Config) ->
+    Req = <<"POST / HTTP/1.1\r\nhost: localhost\r\n",
+            "content-length: 5\r\ntransfer-encoding: chunked\r\n\r\n">>,
+    ?assertMatch({400, _, _}, limit_probe(#{}, Req)).
+
+%% ----------------------------------------------------------------------------
+%% TLS client authentication
+%% ----------------------------------------------------------------------------
+
+%% verify_peer without cacerts is a configuration error: fail closed rather
+%% than listen with client authentication silently disabled.
+tls_verify_peer_requires_cacerts(Config) ->
+    {CertFile, KeyFile} = make_selfsigned_cert(?config(priv_dir, Config)),
+    ?assertEqual({error, verify_peer_requires_cacerts},
+                 h1:start_server(0, #{transport => ssl,
+                                      cert => CertFile, key => KeyFile,
+                                      verify => verify_peer,
+                                      handler => fun echo_handler/5})).
+
+%% cacerts + verify => verify_peer actually enforce mutual TLS: a client
+%% presenting a certificate signed by the CA is served, one without is not.
+tls_mutual_auth(Config) ->
+    #{ca := CA, cert := Cert, key := Key,
+      client_cert := CliCert, client_key := CliKey} =
+        make_ca_signed_certs(?config(priv_dir, Config)),
+    {ok, Ref} = h1:start_server(0, #{transport => ssl,
+                                     cert => Cert, key => Key,
+                                     cacerts => [CA],
+                                     verify => verify_peer,
+                                     handler => fun echo_handler/5,
+                                     acceptors => 1}),
+    try
+        Port = h1:server_port(Ref),
+        Common = [binary, {active, false}, {packet, raw},
+                  {verify, verify_none}, {server_name_indication, "localhost"}],
+        {ok, Sock} = ssl:connect("localhost", Port,
+                                 [{certfile, CliCert}, {keyfile, CliKey}
+                                  | Common], 5000),
+        ok = ssl:send(Sock, <<"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n">>),
+        Resp = ssl_recv_all(Sock, <<>>),
+        ?assertMatch({_, _}, binary:match(Resp, <<"hello world">>)),
+        _ = ssl:close(Sock),
+        %% No client certificate: the connection must not serve a request.
+        %% Under TLS 1.3 the client-side connect returns before the server
+        %% rejects it, so the alert surfaces on the exchange.
+        ?assertMatch({error, _}, tls_get_no_cert(Port, Common))
+    after
+        h1:stop_server(Ref)
+    end.
 
 get_tls(Config0) ->
     {CertFile, KeyFile} = make_selfsigned_cert(?config(priv_dir, Config0)),
@@ -633,10 +732,29 @@ start_tcp_server(Handler, Config) ->
     {ok, Ref} = h1:start_server(0, Opts),
     [{server_ref, Ref} | Config].
 
+%% Start a server with the given limit options, send `Req' verbatim over a raw
+%% socket and return the parsed response. Used to check that a breached limit
+%% is answered with a status rather than a bare close.
+limit_probe(LimitOpts, Req) ->
+    Opts = maps:merge(#{transport => tcp, acceptors => 1,
+                        handler => fun count_body_handler/5}, LimitOpts),
+    {ok, Ref} = h1:start_server(0, Opts),
+    try
+        Port = h1:server_port(Ref),
+        {ok, Sock} = gen_tcp:connect("127.0.0.1", Port,
+                                     [binary, {active, false}, {packet, raw}]),
+        ok = gen_tcp:send(Sock, Req),
+        Resp = recv_http_response(Sock),
+        gen_tcp:close(Sock),
+        Resp
+    after
+        h1:stop_server(Ref)
+    end.
+
 %% Start a server with the given max_body_size (`default' omits the option),
 %% POST a `Size'-byte body framed as `content_length' or `chunked', and return
-%% the echoed byte count on success or `rejected' if the server refused the
-%% body and closed the connection.
+%% the echoed byte count on success or `{rejected, Status}' if the server
+%% refused the body.
 body_cap_probe(Cap, Size, Framing) ->
     %% h1:connect links the client connection to us; when the server rejects
     %% the body and closes, that connection exits {shutdown, peer_closed}.
@@ -665,7 +783,7 @@ body_cap_probe(Cap, Size, Framing) ->
             {ok, Id} ->
                 case collect_response(Conn, Id) of
                     {200, _Hs, Echo} -> binary_to_integer(Echo);
-                    {_Other, _, _}   -> rejected
+                    {Other, _, _}    -> {rejected, Other}
                 end;
             {error, _} -> rejected
         end,
@@ -884,3 +1002,45 @@ make_selfsigned_cert(PrivDir) ->
             _ = os:cmd(lists:flatten(Cmd)),
             {CertFile, KeyFile}
     end.
+
+%% Try a request over a TLS connection opened without a client certificate.
+%% Returns `{error, _}' whether the server rejects the handshake outright
+%% (TLS 1.2) or on the first exchange (TLS 1.3).
+tls_get_no_cert(Port, SslOpts) ->
+    case ssl:connect("localhost", Port, SslOpts, 5000) of
+        {error, _} = E -> E;
+        {ok, Sock} ->
+            Result = case ssl:send(Sock, <<"GET / HTTP/1.1\r\n"
+                                           "host: localhost\r\n\r\n">>) of
+                ok -> ssl:recv(Sock, 0, 5000);
+                Err -> Err
+            end,
+            _ = ssl:close(Sock),
+            Result
+    end.
+
+%% A CA plus a server and a client certificate signed by it, for mutual TLS.
+%% Returns the CA as DER (what the `cacerts' option takes) and the two leaf
+%% pairs as file paths.
+make_ca_signed_certs(PrivDir) ->
+    F = fun(Name) -> filename:join(PrivDir, Name) end,
+    CAKey = F("ca-key.pem"), CAPem = F("ca.pem"),
+    SrvKey = F("srv-key.pem"), SrvPem = F("srv.pem"), SrvCsr = F("srv.csr"),
+    CliKey = F("cli-key.pem"), CliPem = F("cli.pem"), CliCsr = F("cli.csr"),
+    Run = fun(Fmt, Args) ->
+        _ = os:cmd(lists:flatten(io_lib:format(Fmt ++ " 2>/dev/null", Args)))
+    end,
+    Run("openssl req -x509 -newkey rsa:2048 -keyout ~s -out ~s -days 1 "
+        "-nodes -subj '/CN=h1-test-ca'", [CAKey, CAPem]),
+    Sign = fun(Key, Csr, Pem, CN) ->
+        Run("openssl req -newkey rsa:2048 -keyout ~s -out ~s -nodes "
+            "-subj '/CN=~s'", [Key, Csr, CN]),
+        Run("openssl x509 -req -in ~s -CA ~s -CAkey ~s -CAcreateserial "
+            "-out ~s -days 1", [Csr, CAPem, CAKey, Pem])
+    end,
+    Sign(SrvKey, SrvCsr, SrvPem, "localhost"),
+    Sign(CliKey, CliCsr, CliPem, "h1-test-client"),
+    {ok, CAPemBin} = file:read_file(CAPem),
+    [{'Certificate', CADer, not_encrypted} | _] = public_key:pem_decode(CAPemBin),
+    #{ca => CADer, cert => SrvPem, key => SrvKey,
+      client_cert => CliPem, client_key => CliKey}.

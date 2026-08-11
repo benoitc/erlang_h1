@@ -36,6 +36,7 @@
 %% Server API
 -export([start_server/2, start_server/3, stop_server/1, stop_accepting/1,
          server_port/1]).
+-export([serve_socket/2]).
 -export([send_response/4, respond/5, respond/6]).
 -export([send_informational/4]).
 
@@ -81,6 +82,7 @@
     cert => binary() | string(),
     key => binary() | string(),
     cacerts => [binary()],
+    verify => verify_none | verify_peer,
     ssl_opts => [ssl:tls_option()],
     ip => inet:ip_address(),
     inet6 => boolean(),
@@ -91,7 +93,15 @@
     idle_timeout => timeout(),
     request_timeout => timeout(),
     early_response_drain => early_response_drain(),
+    lingering_timeout => timeout(),
+    pipeline => boolean(),
     max_keepalive_requests => pos_integer(),
+    max_line_length => pos_integer(),
+    max_request_line_size => pos_integer() | infinity,
+    max_empty_lines => non_neg_integer(),
+    max_header_name_size => pos_integer(),
+    max_header_value_size => pos_integer(),
+    max_headers => pos_integer(),
     max_header_block_size => pos_integer(),
     max_body_size => pos_integer() | infinity
 }.
@@ -225,33 +235,58 @@ start_tcp(Port, Opts) ->
 start_ssl(Port, Opts) ->
     case {maps:find(cert, Opts), maps:find(key, Opts)} of
         {{ok, Cert}, {ok, Key}} ->
-            Defaults = [binary, {active, false}, {packet, raw},
-                        {reuseaddr, true}, {backlog, 1024}, {nodelay, true},
-                        {certfile, to_list(Cert)}, {keyfile, to_list(Key)},
-                        {alpn_preferred_protocols, [<<"http/1.1">>]}],
-            SslOpts = maps:get(ssl_opts, Opts, []),
-            Listen = merge(Defaults ++ socket_addr_opts(Opts), SslOpts),
-            case ssl:listen(Port, Listen) of
-                {ok, ListenSocket} ->
-                    {ok, {_, Bound}} = ssl:sockname(ListenSocket),
-                    spawn_listener(ssl, ListenSocket, Bound, Opts);
-                {error, Reason} ->
-                    {error, {listen_failed, Reason}}
+            case server_ssl_opts(Cert, Key, Opts) of
+                {ok, Listen} ->
+                    case ssl:listen(Port, Listen) of
+                        {ok, ListenSocket} ->
+                            {ok, {_, Bound}} = ssl:sockname(ListenSocket),
+                            spawn_listener(ssl, ListenSocket, Bound, Opts);
+                        {error, Reason} ->
+                            {error, {listen_failed, Reason}}
+                    end;
+                {error, _} = Error ->
+                    Error
             end;
         _ ->
             {error, {missing_required_option, [cert, key]}}
     end.
 
+%% Build the ssl:listen/2 option list. Honours `verify' (default
+%% `verify_none'), `cacerts' (needed for mutual TLS), and `ssl_opts' as a raw
+%% override. `verify_peer' without CA certificates is rejected so a
+%% misconfigured server fails closed instead of accepting unauthenticated
+%% peers — same contract as h2.
+server_ssl_opts(Cert, Key, Opts) ->
+    Verify = maps:get(verify, Opts, verify_none),
+    CACerts = maps:get(cacerts, Opts, []),
+    case Verify of
+        verify_peer when CACerts =:= [] ->
+            {error, verify_peer_requires_cacerts};
+        _ ->
+            Defaults = [binary, {active, false}, {packet, raw},
+                        {reuseaddr, true}, {backlog, 1024}, {nodelay, true},
+                        {certfile, to_list(Cert)}, {keyfile, to_list(Key)},
+                        {alpn_preferred_protocols, [<<"http/1.1">>]},
+                        {verify, Verify}],
+            %% `verify_peer' alone lets a TLS 1.2 client skip its certificate
+            %% (`fail_if_no_peer_cert' defaults to false), which is not what
+            %% asking for client authentication means. Require the
+            %% certificate; `ssl_opts' can still override.
+            Auth = case {Verify, CACerts} of
+                {_, []} -> [];
+                {verify_peer, _} -> [{cacerts, CACerts},
+                                     {fail_if_no_peer_cert, true}];
+                {_, _} -> [{cacerts, CACerts}]
+            end,
+            SslOpts = maps:get(ssl_opts, Opts, []),
+            Base = Defaults ++ Auth ++ socket_addr_opts(Opts),
+            {ok, merge(Base, SslOpts)}
+    end.
+
 spawn_listener(Transport, ListenSocket, Bound, Opts) ->
     Handler = maps:get(handler, Opts),
     Acceptors = maps:get(acceptors, Opts, erlang:system_info(schedulers)),
-    ConnOpts = maps:with([idle_timeout, request_timeout,
-                          early_response_drain, lingering_timeout,
-                          max_keepalive_requests, pipeline,
-                          max_line_length, max_empty_lines,
-                          max_header_name_size, max_header_value_size,
-                          max_headers, max_header_block_size,
-                          max_body_size], Opts),
+    ConnOpts = conn_opts(Opts),
     ServerOpts = maps:with([handshake_timeout], Opts),
     Ref = make_ref(),
     Args = #{transport => Transport,
@@ -265,12 +300,75 @@ spawn_listener(Transport, ListenSocket, Bound, Opts) ->
         {ok, Pid} ->
             {ok, {Pid, Ref, Bound}};
         {error, Reason} ->
-            close_listen(Transport, ListenSocket),
+            close_socket(Transport, ListenSocket),
             {error, Reason}
     end.
 
-close_listen(gen_tcp, S) -> _ = gen_tcp:close(S), ok;
-close_listen(ssl, S) -> _ = ssl:close(S), ok.
+close_socket(gen_tcp, S) -> _ = gen_tcp:close(S), ok;
+close_socket(ssl, S) -> _ = ssl:close(S), ok.
+
+%% The per-connection slice of the server options. Every path that starts a
+%% server connection (`spawn_listener/4', `serve_socket/2') goes through
+%% this one list, so an option cannot be wired into one path and forgotten
+%% in the other.
+conn_opts(Opts) ->
+    maps:with([idle_timeout, request_timeout,
+               early_response_drain, lingering_timeout,
+               max_keepalive_requests, pipeline,
+               max_line_length, max_request_line_size, max_empty_lines,
+               max_header_name_size, max_header_value_size,
+               max_headers, max_header_block_size,
+               max_body_size], Opts).
+
+%% @doc Serve an already-accepted connection: run the server loop on a
+%% socket someone else accepted. The caller has completed the TCP accept
+%% and, for TLS, the handshake and ALPN negotiation — h1 does not
+%% handshake again, so `cert', `key', `verify' and `ssl_opts' are ignored
+%% here. Use it to serve HTTP/1.1 and HTTP/2 on one TLS port: negotiate
+%% ALPN yourself, then hand `http/1.1' sockets to this function.
+%%
+%% Requires `handler'; every other option is the per-connection subset
+%% `start_server/2' accepts (timeouts, parser limits, drain budget).
+%%
+%% The socket must be passive (`{active, false}'): h1 arms it itself, and
+%% bytes an active socket already delivered to the caller's mailbox cannot
+%% be recovered.
+%%
+%% On `{ok, Pid}' the returned process is linked to the caller and owns
+%% the socket: it is the socket's controlling process from that point on,
+%% and closes it when it exits (unless the socket was handed off by
+%% Upgrade or CONNECT). Killing the caller therefore closes the
+%% connection. These connections belong to no listener, so
+%% `stop_server/1' does not close them.
+%%
+%% ```
+%% {ok, Sock} = ssl:handshake(Raw, 5000),
+%% {ok, <<"http/1.1">>} = ssl:negotiated_protocol(Sock),
+%% {ok, _Pid} = h1:serve_socket(Sock, #{handler => fun my_app:handle/5}).
+%% '''
+-spec serve_socket(ssl:sslsocket() | gen_tcp:socket(), server_opts()) ->
+    {ok, pid()} | {error, term()}.
+serve_socket(Socket, Opts) ->
+    case maps:find(handler, Opts) of
+        {ok, Handler} ->
+            Transport = h1_connection:transport_of(Socket),
+            Args = [Socket, Transport, Handler, conn_opts(Opts), #{}],
+            Pid = proc_lib:spawn_link(h1_server, init_serve, Args),
+            case transfer_socket(Transport, Socket, Pid) of
+                ok ->
+                    Pid ! {h1_server, socket_ready},
+                    {ok, Pid};
+                {error, Reason} ->
+                    Pid ! {h1_server, transfer_failed},
+                    _ = close_socket(Transport, Socket),
+                    {error, {controlling_process, Reason}}
+            end;
+        error ->
+            {error, {missing_required_option, [handler]}}
+    end.
+
+transfer_socket(gen_tcp, Socket, Pid) -> gen_tcp:controlling_process(Socket, Pid);
+transfer_socket(ssl, Socket, Pid) -> ssl:controlling_process(Socket, Pid).
 
 %% @doc Stop a server. Synchronous: closes the listen socket, the
 %% acceptor pool, and every accepted connection (kept-alive and

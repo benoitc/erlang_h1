@@ -417,6 +417,27 @@ Conns = ranch:procs(my_h1, connections),
 
 The `h1:goaway/1,2` call sets the `Connection: close` advertisement on the next response block, causing the state machine to shut once the current exchange finishes.
 
+## Shortcut: `h1:serve_socket/2`
+
+Everything above is the long form. If you do not need to customise the request
+loop, hand the handshaked socket to h1 and let it run the same loop
+`h1:start_server/2` uses:
+
+```erlang
+init(Ref, _Transport, #{handler := Handler} = Opts) ->
+    {ok, Socket} = ranch:handshake(Ref),
+    {ok, Pid} = h1:serve_socket(Socket, Opts#{handler => Handler}),
+    %% serve_socket/2 links Pid to us; stay alive so Ranch keeps counting
+    %% this connection, and go down with it.
+    MRef = erlang:monitor(process, Pid),
+    receive {'DOWN', MRef, process, Pid, _} -> ok end.
+```
+
+`serve_socket/2` takes the same per-connection options as `start_server/2`
+(`idle_timeout`, `request_timeout`, `max_body_size`, the parser limits, the
+drain budget), and it transfers socket ownership to the process it returns —
+so call it from the process Ranch handed the socket to.
+
 ## Gotchas
 
 - **Socket ownership timing.** `controlling_process/2` must be called on the right transport module (`gen_tcp` for TCP, `ssl` for TLS). Mis-match and the transfer silently fails. Using `Transport:controlling_process(Socket, Pid)` where `Transport` is the alias module (`ranch_tcp` / `ranch_ssl`) also works — the function is re-exported — but be consistent.
@@ -428,6 +449,7 @@ The `h1:goaway/1,2` call sets the `Connection: close` advertisement on the next 
 
 ## See also
 
+- [`h1:serve_socket/2`](../README.md#serving-a-socket-you-accepted-yourself) does everything on this page for you: hand it the socket `ranch:handshake/1` returned and it runs the connection and handler loop. Write a protocol module by hand only when you need to change that loop.
 - [`h1:start_server/2,3`](../README.md#server) for the in-tree listener with the same acceptor pattern.
 - [Upgrade + capsules](../README.md#upgrade--capsules) for the 101 handshake API.
 - [Events reference](../README.md#events-reference) for the full list of `{h1, Conn, _}` messages.

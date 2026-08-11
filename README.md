@@ -34,11 +34,11 @@ was already taken on hex.pm). The OTP application and module atom stay
 
 ```erlang
 %% rebar.config — from hex
-{deps, [{erlang_h1, "0.8.0"}]}.
+{deps, [{erlang_h1, "0.9.0"}]}.
 
 %% Or directly from git
 {deps, [
-    {erlang_h1, {git, "https://github.com/benoitc/erlang_h1.git", {tag, "0.8.0"}}}
+    {erlang_h1, {git, "https://github.com/benoitc/erlang_h1.git", {tag, "0.9.0"}}}
 ]}.
 ```
 
@@ -362,6 +362,36 @@ Not calling `h1:continue/2` (and instead sending the final response directly) is
 
 `h1_server` spawns one handler process per request but blocks the connection loop until that handler exits before accepting the next request. This guarantees pipelined response bytes are written in order, as required by RFC 9112 §9.3. Handlers still get their own mailbox for body streaming. Scale request-rate by raising `acceptors` (default: one per scheduler).
 
+### Serving a socket you accepted yourself
+
+Use `h1:serve_socket/2` when something else owns the listen socket: your own
+acceptor pool, Ranch, or a TLS port that dispatches on ALPN. Accept the
+connection and finish the TLS handshake yourself, then hand the socket over —
+h1 does not handshake again.
+
+```erlang
+{ok, Raw} = ssl:transport_accept(Listen),
+{ok, Sock} = ssl:handshake(Raw, 5000),
+case ssl:negotiated_protocol(Sock) of
+    {ok, <<"h2">>}       -> h2:serve_socket(Sock, H2Opts);
+    {ok, <<"http/1.1">>} -> h1:serve_socket(Sock, #{handler => Handler});
+    _                    -> h1:serve_socket(Sock, #{handler => Handler})
+end.
+```
+
+It takes the same per-connection options as `start_server/2` (timeouts, parser
+limits, drain budget); `cert`, `key`, `verify` and `ssl_opts` are ignored
+because the handshake already happened. Notes:
+
+- Call it from the process that owns the socket — it transfers ownership to
+  the process it returns.
+- Hand it a passive socket (`{active, false}`). h1 arms the socket itself, and
+  bytes an active socket already delivered to your mailbox are lost.
+- That process is **linked to the caller**: killing the caller closes the
+  connection, and the connection closing does not kill the caller.
+- The connection is not tracked by any listener, so `h1:stop_server/1` does not
+  close it. Hold the returned pid if you need to shut it down.
+
 ## Upgrade + capsules
 
 The `Upgrade` / 101 handshake is exposed at the public API. After a successful upgrade the raw socket is transferred to the caller with any leftover bytes the parser had buffered.
@@ -461,6 +491,29 @@ Or pin a specific CA chain:
 
 `cert` and `key` accept either file paths (as string or binary). The acceptor pool does `transport_accept` only; the TLS handshake itself runs in the per-connection process so one slow handshake never blocks the accept queue. Override `handshake_timeout` (default 30 s) in the server opts.
 
+### Server requiring a client certificate (mTLS)
+
+```erlang
+{ok, CAPem} = file:read_file("ca.pem"),
+CAs = [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(CAPem)],
+
+{ok, Server} = h1:start_server(8443, #{
+    transport => ssl,
+    cert      => "server.pem",
+    key       => "server-key.pem",
+    cacerts   => CAs,
+    verify    => verify_peer,
+    handler   => Handler
+}).
+```
+
+`verify => verify_peer` requires `cacerts`; without them `start_server/2`
+returns `{error, verify_peer_requires_cacerts}` instead of listening with
+client authentication silently disabled. It also implies
+`fail_if_no_peer_cert`, so a client that presents no certificate is rejected on
+TLS 1.2 as well as 1.3. Pass `{fail_if_no_peer_cert, false}` in `ssl_opts` if
+you want optional client certificates.
+
 ## Tuning
 
 ### Connect and server opts
@@ -481,7 +534,8 @@ Or pin a specific CA chain:
 #{transport              => tcp | ssl,                 %% default: tcp
   cert                   => binary() | string(),       %% required for ssl
   key                    => binary() | string(),       %% required for ssl
-  cacerts                => [binary()],
+  cacerts                => [binary()],                %% trust anchors for client certs
+  verify                 => verify_none | verify_peer, %% default: verify_none
   handler                := fun(...) | module(),       %% required
   acceptors              => pos_integer(),             %% default: erlang:system_info(schedulers)
   handshake_timeout      => timeout(),                 %% default: 30_000
@@ -489,8 +543,19 @@ Or pin a specific CA chain:
   request_timeout        => timeout() | infinity,
   early_response_drain   => 0 | {MaxBytes, MaxMs},     %% default: {infinity, 30_000}
   max_keepalive_requests => pos_integer(),
+  pipeline               => boolean(),
+  max_line_length        => pos_integer(),
+  max_request_line_size  => pos_integer() | infinity,
+  max_empty_lines        => non_neg_integer(),
+  max_header_name_size   => pos_integer(),
+  max_header_value_size  => pos_integer(),
+  max_headers            => pos_integer(),
+  max_header_block_size  => pos_integer(),
   max_body_size          => pos_integer() | infinity}.
 ```
+
+Every option below `handshake_timeout` is per-connection and is also accepted
+by [`h1:serve_socket/2`](#serving-a-socket-you-accepted-yourself).
 
 `early_response_drain` bounds how much of an unread request body the server
 reads and discards after responding early (see "Responding before the body is
@@ -508,16 +573,27 @@ Pass `infinity` to disable.
 
 `max_body_size` (default 8 MB) bounds `Content-Length` and chunked body accumulation per stream. Exceeding it causes the parser to return `{error, body_too_large}` and the connection to shut. Set to `infinity` if you truly want unbounded uploads, but prefer a per-route enforcement when possible.
 
-### Header and URI limits
+### Request line, header and URI limits
 
-Inherited from the parser record in `include/h1.hrl`:
+Defaults come from the parser record in `include/h1.hrl`:
 
-- `max_line_length` — 16 KiB
+- `max_request_line_size` — 8 KiB (method + SP + target + SP + version)
+- `max_line_length` — 16 KiB (bound on any single unterminated line)
 - `max_header_name_size` — 256 bytes
 - `max_header_value_size` — 8 KiB
 - `max_headers` — 100
+- `max_header_block_size` — 64 KiB
 
-All are parser options you can override via the connect/server opts map.
+All are parser options you can override via the connect/server opts map. The
+request target is additionally capped at 8 KiB and the method at 16 bytes by
+the `?H1_MAX_URI_SIZE` / `?H1_MAX_METHOD_SIZE` macros, which are not options.
+
+A server answers a breach rather than dropping the connection: it writes the
+status the limit maps to (`431` for header limits, `414` for the request line
+or target, `413` for the body, `400` for a malformed message, `505` for an
+unsupported version) with `Connection: close`, drains what the client is still
+sending, and closes. Timeouts and already-answered requests still close without
+a response.
 
 ## Events reference
 
@@ -560,6 +636,7 @@ Failures return `{error, Reason}` from API calls or appear as `{closed, Reason}`
 | `too_many_headers` | header count exceeded `max_headers` |
 | `header_name_too_long` / `header_value_too_long` | field size over limit |
 | `method_too_long` / `uri_too_long` / `line_too_long` | request-line piece over limit |
+| `request_line_too_long` | whole request line over `max_request_line_size` |
 | `bad_request` | malformed request line, status line, or version |
 | `idle_timeout` / `request_timeout` | connection/request was silent past its cap |
 | `pipeline_disabled` | `pipeline => false` and a prior request was still in flight |

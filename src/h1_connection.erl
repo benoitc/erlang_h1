@@ -46,6 +46,7 @@
 -export([get_settings/1, get_peer_settings/1]).
 -export([set_pipeline/2]).
 -export([close/1]).
+-export([transport_of/1]).
 
 %% gen_statem callbacks
 -export([init/1, callback_mode/0, terminate/3, code_change/4]).
@@ -379,12 +380,16 @@ normalize_drain_budget({B, M} = Budget)
 parser_base_opts(Type, Opts) ->
     [Type
      | [{K, V}
-        || K <- [max_line_length, max_empty_lines, max_header_name_size,
-                 max_header_value_size, max_headers, max_header_block_size,
-                 max_body_size],
+        || K <- [max_line_length, max_request_line_size, max_empty_lines,
+                 max_header_name_size, max_header_value_size, max_headers,
+                 max_header_block_size, max_body_size],
            V <- [maps:get(K, Opts, undefined)],
            V =/= undefined]].
 
+%% @doc Transport module for a socket. `h1_connection' infers it from the
+%% socket itself; `h1_server' and `h1:serve_socket/2' need the same atom for
+%% their own close/transfer dispatch.
+-spec transport_of(term()) -> gen_tcp | ssl.
 transport_of(Socket) ->
     case is_tuple(Socket) andalso element(1, Socket) =:= sslsocket of
         true -> ssl;
@@ -691,8 +696,56 @@ handle_socket_data(Data, #state{parser = P, mode = Mode} = State) ->
         {upgrade_client, Stream, NewParser, State1} ->
             complete_client_upgrade(Stream, NewParser, State1);
         {error, Reason, State1} ->
-            {stop, {shutdown, Reason}, State1}
+            answer_parse_error(Reason, State1)
     end.
+
+%% A server answers a malformed or over-limit request with the status
+%% `h1_error' maps the reason to, then closes (RFC 9112 §9.6). Reasons that
+%% classify as timeouts or closes, and breaches that trip after response
+%% bytes are already on the wire, keep closing without an answer.
+answer_parse_error(Reason, #state{mode = server} = State) ->
+    case answerable(Reason, State) of
+        true ->
+            State1 = send_error_response(Reason, State),
+            enter_lingering_close([], State1#state.drain_budget, State1);
+        false ->
+            {stop, {shutdown, Reason}, State}
+    end;
+answer_parse_error(Reason, State) ->
+    {stop, {shutdown, Reason}, State}.
+
+answerable(Reason, State) ->
+    case h1_error:classify(Reason) of
+        parse_error  -> not response_started(State);
+        client_error -> not response_started(State);
+        _            -> false
+    end.
+
+%% True once any response byte for the in-flight stream has been written:
+%% `resp_framing' is set when the response header block goes out. A breach
+%% between requests (no current stream) or before the response is answerable.
+response_started(#state{current_stream = undefined}) ->
+    false;
+response_started(#state{current_stream = Id, streams = Streams}) ->
+    case maps:find(Id, Streams) of
+        {ok, #stream{resp_framing = undefined}} -> false;
+        {ok, _}                                 -> true;
+        error                                   -> false
+    end.
+
+%% Written raw rather than through send_response/4: at `line_too_long' or
+%% `request_line_too_long' the parser failed before on_request/5 created a
+%% stream, so there is nothing to send a response on.
+send_error_response(Reason, State) ->
+    Body = iolist_to_binary(h1_error:format(Reason)),
+    Wire = [h1_message:status_line(h1_error:status(Reason), ?HTTP_1_1),
+            h1_message:headers([{<<"content-length">>,
+                                 integer_to_binary(byte_size(Body))},
+                                {<<"connection">>, <<"close">>},
+                                {<<"content-type">>, <<"text/plain">>}]),
+            <<"\r\n">>, Body],
+    _ = sock_send(State, Wire),
+    State#state{close_after = true, current_stream = undefined}.
 
 %% Re-arm request timer if a request is in flight, cancel otherwise.
 request_timer_actions(#state{mode = client, pending = Q} = State) ->

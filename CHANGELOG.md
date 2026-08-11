@@ -4,6 +4,50 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] - 0.9.0
+
+### Added
+
+- `h1:serve_socket/2`: run the server loop on a socket the caller already
+  accepted (and, for TLS, already handshaked and ALPN-negotiated). h1 does not
+  handshake again, so one TLS port can dispatch `h2` and `http/1.1` sockets to
+  their own library. The returned process is linked to the caller and owns the
+  socket; it closes it when it exits, and it exits when the caller does. These
+  connections belong to no listener, so `stop_server/1` does not close them.
+- `max_request_line_size` (default 8 KiB): a real total request-line cap
+  (method + SP + target + SP + version), checked both while the line is still
+  unterminated and once it is complete. `max_line_length` only ever bounded an
+  unterminated line, so a complete over-long request line passed it. Breaching
+  it gives `request_line_too_long` → 414. The `?H1_MAX_URI_SIZE` (8 KiB) and
+  `?H1_MAX_METHOD_SIZE` (16 B) macros were *not* promoted to options; they
+  still cap their own pieces first, so an over-long target keeps reporting
+  `uri_too_long`.
+- `verify` server option (default `verify_none`). `verify => verify_peer`
+  requires `cacerts` — a server configured for client authentication without a
+  trust anchor is rejected with `{error, verify_peer_requires_cacerts}` rather
+  than listening with authentication silently disabled — and implies
+  `fail_if_no_peer_cert`, which `ssl_opts` can still override.
+
+### Changed
+
+- A server now answers a malformed or over-limit request with the status
+  `h1_error` maps it to (431, 414, 413, 400, 505) plus `Connection: close`,
+  then closes; previously the client saw a bare TCP/TLS close. The response is
+  followed by the usual bounded inbound drain, so a 413 is not reset away
+  mid-upload. Reasons that classify as timeouts or closes, and breaches that
+  trip after response bytes are already on the wire, still close without an
+  answer.
+- `server_opts()` declares every option `start_server/2` accepts:
+  `max_line_length`, `max_request_line_size`, `max_empty_lines`,
+  `max_header_name_size`, `max_header_value_size`, `max_headers`, `pipeline`,
+  `lingering_timeout` and `verify`. They were accepted but undeclared.
+
+### Fixed
+
+- `start_server/2,3` now honours `cacerts` in `ssl` mode. The option was
+  declared in `server_opts()` and dropped when building the listen options, so
+  a server configured for mutual TLS accepted any client.
+
 ## [0.8.0] - 2026-08-07
 
 ### Added

@@ -17,6 +17,7 @@
 -define(H1_MAX_CHUNK_SIZE,        1048576).   %% 1 MB
 -define(H1_MAX_BODY_SIZE,         8388608).   %% 8 MB
 -define(H1_MAX_LINE_LENGTH,       16384).     %% hackney default
+-define(H1_MAX_REQUEST_LINE_SIZE, 8192).      %% method + SP + target + SP + version
 -define(H1_MAX_HEADER_BLOCK_SIZE, 65536).     %% total header-block bytes (DoS guard)
 -define(H1_MAX_EMPTY_LINES,       10).
 -define(H1_MAX_CHUNK_SIZE_HEX,    16).         %% 64-bit max, way past any legit chunk
@@ -68,6 +69,11 @@
     body_read        = 0 :: non_neg_integer(),
     %% Limits
     max_line_length  = ?H1_MAX_LINE_LENGTH   :: pos_integer(),
+    %% Total request-line budget (method + SP + target + SP + version),
+    %% checked both while the line is still unterminated and once it is
+    %% complete. Requests only; the status line is bounded by
+    %% max_line_length.
+    max_request_line_size = ?H1_MAX_REQUEST_LINE_SIZE :: pos_integer() | infinity,
     max_empty_lines  = ?H1_MAX_EMPTY_LINES   :: non_neg_integer(),
     max_header_name_size  = ?H1_MAX_HEADER_NAME_SIZE  :: pos_integer(),
     max_header_value_size = ?H1_MAX_HEADER_VALUE_SIZE :: pos_integer(),

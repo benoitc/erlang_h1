@@ -29,7 +29,8 @@
                       | conflicting_framing
                       | body_too_large
                       | method_too_long
-                      | uri_too_long.
+                      | uri_too_long
+                      | request_line_too_long.
 
 -type conn_reason() :: request_timeout
                      | idle_timeout
@@ -66,6 +67,7 @@ classify(conflicting_framing)      -> parse_error;
 classify(body_too_large)           -> client_error;
 classify(method_too_long)          -> client_error;
 classify(uri_too_long)             -> client_error;
+classify(request_line_too_long)    -> client_error;
 classify(request_timeout)          -> timeout;
 classify(idle_timeout)             -> timeout;
 classify(expect_timeout)           -> timeout;
@@ -98,6 +100,7 @@ status(conflicting_framing)      -> 400;
 status(body_too_large)           -> 413;
 status(method_too_long)          -> 400;
 status(uri_too_long)             -> 414;
+status(request_line_too_long)    -> 414;
 status(request_timeout)          -> 408;
 status(idle_timeout)             -> 408;
 status(expect_timeout)           -> 417;
@@ -125,6 +128,7 @@ format(conflicting_framing)      -> "Both Content-Length and Transfer-Encoding p
 format(body_too_large)           -> "Body exceeds configured maximum size";
 format(method_too_long)          -> "Method token exceeds configured limit";
 format(uri_too_long)             -> "Request URI exceeds configured limit";
+format(request_line_too_long)    -> "Request line exceeds configured limit";
 format(request_timeout)          -> "Timed out waiting for request";
 format(idle_timeout)             -> "Connection idle for too long";
 format(expect_timeout)           -> "No 100 Continue received within timeout";
@@ -152,6 +156,7 @@ status_test_() ->
         ?_assertEqual(400, status(bad_request)),
         ?_assertEqual(431, status(line_too_long)),
         ?_assertEqual(413, status(body_too_large)),
+        ?_assertEqual(414, status(request_line_too_long)),
         ?_assertEqual(500, status({something, other}))
     ].
 
