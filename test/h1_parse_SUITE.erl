@@ -46,7 +46,8 @@
     parse_response_304_suppresses_body/1,
     parse_response_1xx_suppresses_body/1,
     parse_enforces_max_body_size_identity/1,
-    parse_enforces_max_body_size_chunked/1
+    parse_enforces_max_body_size_chunked/1,
+    parse_chunked_every_split_point/1
 ]).
 
 all() ->
@@ -70,7 +71,7 @@ groups() ->
        parse_response_with_header_whitespace]},
      {body, [],
       [parse_chunked_body, parse_chunked_with_trailers, parse_chunk_extensions,
-       parse_incremental_bytes]},
+       parse_incremental_bytes, parse_chunked_every_split_point]},
      {robustness, [],
       [parse_reject_conflicting_framing, parse_too_many_headers,
        parse_method_too_long, parse_uri_too_long,
@@ -257,6 +258,47 @@ parse_incremental_bytes(_Config) ->
     ?assertEqual(<<"a">>, proplists:get_value(<<"host">>, Headers)),
     ?assertEqual(<<"z">>, proplists:get_value(<<"x-y">>, Headers)),
     ?assertEqual(<<>>, Rest).
+
+%% Segmentation fuzz for the chunked decoder: the same message is fed
+%% split at every byte offset (two segments), then one byte at a time, and
+%% the reassembled body must match byte for byte each time. This pins the
+%% splits around the chunk-size line, the chunk terminator and the final
+%% `0\r\n\r\n', where a segment boundary between CR and LF used to be
+%% answered with `invalid_chunk_size'.
+parse_chunked_every_split_point(_Config) ->
+    Head = <<"PUT /up HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n">>,
+    Parts = [binary:copy(<<"a">>, 16#10), binary:copy(<<"b">>, 16#a),
+             binary:copy(<<"c">>, 16#100), <<"d">>],
+    Chunks = [[integer_to_binary(byte_size(B), 16), "\r\n", B, "\r\n"] || B <- Parts],
+    Wire = iolist_to_binary([Head, Chunks, "1f;ext=1\r\n", binary:copy(<<"e">>, 16#1f),
+                             "\r\n0\r\nx-t: 1\r\n\r\n"]),
+    Expected = iolist_to_binary([Parts, binary:copy(<<"e">>, 16#1f)]),
+    N = byte_size(Wire),
+    lists:foreach(fun(I) ->
+        <<A:I/binary, B/binary>> = Wire,
+        ?assertEqual({I, Expected}, {I, chunked_reassemble([A, B])})
+    end, lists:seq(1, N - 1)),
+    ?assertEqual(Expected, chunked_reassemble([<<C>> || <<C>> <= Wire])).
+
+chunked_reassemble(Segments) ->
+    chunked_reassemble(h1_parse:parser([request]), Segments, []).
+
+chunked_reassemble(P, Segments, Acc) ->
+    {Ev, Rest} = case Segments of
+        [] -> {h1_parse:execute(P), []};
+        [S | More] -> {h1_parse:execute(P, S), More}
+    end,
+    case Ev of
+        {more, P1} -> chunked_reassemble(P1, Rest, Acc);
+        {more, P1, _} -> chunked_reassemble(P1, Rest, Acc);
+        {request, _, _, _, P1} -> chunked_reassemble(P1, Rest, Acc);
+        {header, _, P1} -> chunked_reassemble(P1, Rest, Acc);
+        {headers_complete, P1} -> chunked_reassemble(P1, Rest, Acc);
+        {ok, Chunk, P1} -> chunked_reassemble(P1, Rest, [Chunk | Acc]);
+        {trailer, _, P1} -> chunked_reassemble(P1, Rest, Acc);
+        {done, <<>>} -> iolist_to_binary(lists:reverse(Acc));
+        {error, R} -> error({parse_failed, R})
+    end.
 
 feed_incrementally(P, [], _, Acc) ->
     case h1_parse:execute(P) of

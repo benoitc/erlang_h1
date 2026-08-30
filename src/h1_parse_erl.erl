@@ -760,6 +760,9 @@ read_size(<<"\n", Rest/binary>>, Size, Len) when Len > 0 ->
     {ok, Size, Rest};
 read_size(<<"\r\n", _/binary>>, _, 0) -> eof;
 read_size(<<"\n", _/binary>>, _, 0) -> eof;
+%% A segment boundary between the CR and LF of the size line: the CR is
+%% the start of a terminator, not a bad digit. Wait for the LF.
+read_size(<<"\r">>, _, _) -> eof;
 read_size(<<$;, Rest/binary>>, Size, Len) when Len > 0 ->
     skip_ext(Rest, Size, 0);
 read_size(<<$\s, Rest/binary>>, Size, Len) when Len > 0 ->

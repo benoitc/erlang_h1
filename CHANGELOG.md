@@ -4,6 +4,18 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.9.1] - 2026-08-30
+
+### Fixed
+
+- A chunked request body was answered `400 Chunk size is not valid hex`
+  whenever a socket segment ended between the CR and LF of a chunk-size line.
+  `read_size/3` had no clause for a trailing lone CR and treated it as a bad
+  digit instead of waiting for the LF; the chunk-data and extension paths
+  already handled that split. Large uploads in many chunks tripped it under
+  load. `h1_parse:parse_chunk/1,2` returned `{error, invalid_chunk_size}` on
+  the same input and now returns `{more, Data}`.
+
 ## [0.9.0] - 2026-08-11
 
 ### Added

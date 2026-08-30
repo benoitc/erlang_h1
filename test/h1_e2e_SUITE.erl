@@ -29,6 +29,7 @@
     max_body_size_raised_chunked/1,
     max_body_size_infinity/1,
     max_body_size_default_rejects/1,
+    large_chunked_upload_slow_handler/1,
     limit_request_line_414/1,
     limit_header_block_431/1,
     limit_max_headers_431/1,
@@ -57,6 +58,7 @@ all() ->
             early_response_lingering_timeout_alias,
             max_body_size_raised_content_length, max_body_size_raised_chunked,
             max_body_size_infinity, max_body_size_default_rejects,
+            large_chunked_upload_slow_handler,
             limit_request_line_414, limit_header_block_431,
             limit_max_headers_431, limit_body_size_413,
             limit_conflicting_framing_400,
@@ -202,12 +204,24 @@ count_body_handler(Conn, StreamId, _M, _P, _H) ->
     ok = h1:respond(Conn, StreamId, 200,
                     [{<<"content-type">>, <<"text/plain">>}], Body).
 
+%% Same, but pauses on every data event so socket segments pile up while
+%% the connection is delivering a chunk.
+slow_count_body_handler(Conn, StreamId, _M, _P, _H) ->
+    Total = drain_request_body(StreamId, 0, 2),
+    ok = h1:respond(Conn, StreamId, 200,
+                    [{<<"content-type">>, <<"text/plain">>}],
+                    integer_to_binary(Total)).
+
 drain_request_body(StreamId, Acc) ->
+    drain_request_body(StreamId, Acc, 0).
+
+drain_request_body(StreamId, Acc, PauseMs) ->
     receive
         {h1_stream, StreamId, {data, Chunk, true}} ->
             Acc + byte_size(Chunk);
         {h1_stream, StreamId, {data, Chunk, false}} ->
-            drain_request_body(StreamId, Acc + byte_size(Chunk));
+            timer:sleep(PauseMs),
+            drain_request_body(StreamId, Acc + byte_size(Chunk), PauseMs);
         {h1_stream, StreamId, {trailers, _}} ->
             Acc
     after 10000 -> Acc
@@ -444,6 +458,42 @@ max_body_size_raised_chunked(_Config) ->
     Cap = 32 * 1024 * 1024,
     Size = 20 * 1024 * 1024,
     ?assertEqual(Size, body_cap_probe(Cap, Size, chunked)).
+
+%% A 24 MiB body streamed as 64 KiB chunks over a raw socket, each chunk's
+%% size line written in two sends split between CR and LF with a pause in
+%% between so the server reads the CR alone, while the handler consumes
+%% slowly so segments arrive mid-delivery. The server must reassemble every
+%% byte rather than answer 400 at a split size line.
+large_chunked_upload_slow_handler(_Config) ->
+    Opts = #{transport => tcp, handler => fun slow_count_body_handler/5,
+             acceptors => 1, max_body_size => 32 * 1024 * 1024},
+    {ok, Ref} = h1:start_server(0, Opts),
+    try
+        Port = h1:server_port(Ref),
+        {ok, Sock} = gen_tcp:connect("127.0.0.1", Port,
+                                     [binary, {active, false}, {packet, raw},
+                                      {nodelay, true}]),
+        ChunkSize = 64 * 1024,
+        Count = 24 * 1024 * 1024 div ChunkSize,
+        Chunk = binary:copy(<<"0123456789abcdef">>, ChunkSize div 16),
+        SizeLine = integer_to_binary(ChunkSize, 16),
+        ok = gen_tcp:send(Sock, <<"PUT /blob HTTP/1.1\r\nHost: localhost\r\n"
+                                  "Transfer-Encoding: chunked\r\n\r\n">>),
+        lists:foreach(fun(_) ->
+            ok = gen_tcp:send(Sock, <<SizeLine/binary, "\r">>),
+            timer:sleep(3),
+            ok = gen_tcp:send(Sock, <<"\n", Chunk/binary, "\r\n">>)
+        end, lists:seq(1, Count)),
+        ok = gen_tcp:send(Sock, <<"0\r">>),
+        timer:sleep(3),
+        ok = gen_tcp:send(Sock, <<"\n\r\n">>),
+        {Status, _Hs, Body} = recv_http_response(Sock),
+        gen_tcp:close(Sock),
+        ?assertEqual(200, Status),
+        ?assertEqual(Count * ChunkSize, binary_to_integer(Body))
+    after
+        h1:stop_server(Ref)
+    end.
 
 %% max_body_size => infinity disables the cap entirely.
 max_body_size_infinity(_Config) ->
