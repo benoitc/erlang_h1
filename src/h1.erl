@@ -524,6 +524,11 @@ upgrade(Conn, Protocol, Headers, Timeout) ->
 %% any caller-supplied copies (case-insensitive), so the 101 carries
 %% exactly one of each. Pass only protocol-specific extras in
 %% ExtraHeaders (e.g. `sec-websocket-accept').
+%%
+%% The socket is passive when this returns. Bytes the client already sent are in
+%% the returned buffer or still in the socket, in order. If the connection
+%% already saw a close or error, the caller also gets that as a socket message,
+%% such as `{tcp_closed, Socket}'.
 -spec accept_upgrade(connection(), stream_id(), headers()) ->
     {ok, term(), binary()} | {error, term()}.
 accept_upgrade(Conn, StreamId, ExtraHeaders) ->
@@ -534,6 +539,7 @@ accept_upgrade(Conn, StreamId, ExtraHeaders) ->
 %% and take ownership of the raw socket. Mirror of `accept_upgrade/3' for
 %% the 101 Switching Protocols case, but writes status 200 and injects no
 %% Connection/Upgrade headers so bytes after CRLF belong to the tunnel.
+%% The handover guarantees are the same as for `accept_upgrade/3'.
 -spec accept_connect(connection(), stream_id(), headers()) ->
     {ok, gen_tcp | ssl, term(), binary()} | {error, term()}.
 accept_connect(Conn, StreamId, ExtraHeaders) ->

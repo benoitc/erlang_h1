@@ -624,12 +624,14 @@ set_active_once(#state{socket = S, transport = ssl} = St) ->
         {error, _} -> self() ! {ssl_closed, S}, St
     end.
 
-set_active_false(#state{socket = S, transport = gen_tcp} = St) ->
-    _ = inet:setopts(S, [{active, false}]),
-    St;
-set_active_false(#state{socket = S, transport = ssl} = St) ->
-    _ = ssl:setopts(S, [{active, false}]),
+set_active_false(St) ->
+    _ = set_passive(St),
     St.
+
+set_passive(#state{socket = S, transport = gen_tcp}) ->
+    inet:setopts(S, [{active, false}]);
+set_passive(#state{socket = S, transport = ssl}) ->
+    ssl:setopts(S, [{active, false}]).
 
 sock_send(#state{transport = gen_tcp, socket = S}, Data) -> gen_tcp:send(S, Data);
 sock_send(#state{transport = ssl,    socket = S}, Data) -> ssl:send(S, Data).
@@ -1651,24 +1653,17 @@ handle_accept_upgrade(From, StreamId, ExtraHeaders, State) ->
                     Wire = [h1_message:status_line(101, ?HTTP_1_1),
                             h1_message:headers(Hdrs),
                             <<"\r\n">>],
-                    case sock_send(State, Wire) of
+                    case send_handover_response(Wire, State) of
                         ok ->
-                            Buffer = h1_parse_erl:get(State#state.parser, buffer),
-                            State1 = set_active_false(State),
-                            {FromPid, _} = From,
-                            _ = case State1#state.transport of
-                                gen_tcp -> gen_tcp:controlling_process(State1#state.socket, FromPid);
-                                ssl     -> ssl:controlling_process(State1#state.socket, FromPid)
-                            end,
-                            gen_statem:reply(From, {ok, State1#state.socket, Buffer}),
-                            notify(State1#state.owner,
+                            Buffer = hand_over_socket(From, State),
+                            gen_statem:reply(From, {ok, State#state.socket, Buffer}),
+                            notify(State#state.owner,
                                 {upgraded, StreamId, Proto,
-                                 State1#state.socket, Buffer, Hdrs}, self()),
+                                 State#state.socket, Buffer, Hdrs}, self()),
                             {stop, {shutdown, upgraded},
-                             State1#state{socket_handed_off = true}};
+                             State#state{socket_handed_off = true}};
                         {error, R} ->
-                            {keep_state_and_data,
-                             [{reply, From, {error, R}}]}
+                            handover_failed(From, R, State)
                     end
             end;
         error ->
@@ -1686,30 +1681,77 @@ handle_accept_connect(From, StreamId, ExtraHeaders, State) ->
                                            ?HTTP_1_1),
                     h1_message:headers(ExtraHeaders),
                     <<"\r\n">>],
-            case sock_send(State, Wire) of
+            case send_handover_response(Wire, State) of
                 ok ->
-                    Buffer = h1_parse_erl:get(State#state.parser, buffer),
-                    State1 = set_active_false(State),
-                    {FromPid, _} = From,
-                    Transport = State1#state.transport,
-                    Socket = State1#state.socket,
-                    _ = case Transport of
-                        gen_tcp -> gen_tcp:controlling_process(Socket, FromPid);
-                        ssl     -> ssl:controlling_process(Socket, FromPid)
-                    end,
+                    Buffer = hand_over_socket(From, State),
+                    Transport = State#state.transport,
+                    Socket = State#state.socket,
                     gen_statem:reply(From,
                                      {ok, Transport, Socket, Buffer}),
-                    notify(State1#state.owner,
+                    notify(State#state.owner,
                            {connected, StreamId, Transport, Socket, Buffer},
                            self()),
                     {stop, {shutdown, connected},
-                     State1#state{socket_handed_off = true}};
+                     State#state{socket_handed_off = true}};
                 {error, R} ->
-                    {keep_state_and_data, [{reply, From, {error, R}}]}
+                    handover_failed(From, R, State)
             end;
         error ->
             {keep_state_and_data, [{reply, From, {error, unknown_stream}}]}
     end.
+
+%% Write the response that ends HTTP on this connection. The socket goes passive
+%% first, so whatever a client sends once it reads the response stays in the
+%% socket for the new owner. A socket that cannot go passive is already closed.
+send_handover_response(Wire, State) ->
+    case set_passive(State) of
+        ok -> sock_send(State, Wire);
+        {error, _} -> {error, closed}
+    end.
+
+%% The socket is passive, so nothing more can reach this mailbox: `setopts'
+%% returning means gen_tcp's port or the TLS process has stopped delivering, and
+%% it sent anything earlier before its reply. Bytes delivered before that go to
+%% the caller in the buffer. Close and error events go to its mailbox, because
+%% `gen_tcp:controlling_process/2' only forwards what is still queued here and
+%% `ssl:controlling_process/2' forwards nothing.
+hand_over_socket({NewOwner, _}, #state{parser = Parser, transport = Transport,
+                                       socket = Socket}) ->
+    Parsed = h1_parse_erl:get(Parser, buffer),
+    {Delivered, Events} = drain_socket_messages(Socket, [], []),
+    Visible = case {give_socket(Transport, Socket, NewOwner), Events} of
+        %% The socket went away without an event, and an active owner still has
+        %% to learn it.
+        {{error, _}, []} -> [closed_event(Transport, Socket)];
+        _ -> Events
+    end,
+    lists:foreach(fun(Event) -> NewOwner ! Event end, Visible),
+    iolist_to_binary([Parsed | Delivered]).
+
+drain_socket_messages(S, Data, Events) ->
+    receive
+        {tcp, S, Bin} -> drain_socket_messages(S, [Bin | Data], Events);
+        {ssl, S, Bin} -> drain_socket_messages(S, [Bin | Data], Events);
+        {tcp_closed, S} = E -> drain_socket_messages(S, Data, [E | Events]);
+        {ssl_closed, S} = E -> drain_socket_messages(S, Data, [E | Events]);
+        {tcp_error, S, _} = E -> drain_socket_messages(S, Data, [E | Events]);
+        {ssl_error, S, _} = E -> drain_socket_messages(S, Data, [E | Events])
+    after 0 ->
+        {lists:reverse(Data), lists:reverse(Events)}
+    end.
+
+give_socket(gen_tcp, Socket, NewOwner) -> gen_tcp:controlling_process(Socket, NewOwner);
+give_socket(ssl, Socket, NewOwner)     -> ssl:controlling_process(Socket, NewOwner).
+
+closed_event(gen_tcp, Socket) -> {tcp_closed, Socket};
+closed_event(ssl, Socket)     -> {ssl_closed, Socket}.
+
+%% The socket is passive and no handover happened. Read again, or a peer that
+%% leaves goes unnoticed. The write failed, so no tunnel is coming: a pending
+%% upgrade is over too, and any bytes still queued go through the parser.
+handover_failed(From, Reason, State) ->
+    State1 = set_active_once(State#state{upgrade_pending = false}),
+    {keep_state, State1, [{reply, From, {error, Reason}}]}.
 
 %% ----------------------------------------------------------------------------
 %% Helpers

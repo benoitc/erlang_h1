@@ -4,6 +4,24 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.9.2] - 2026-11-05
+
+### Fixed
+
+- A server accepting a CONNECT tunnel could lose data. If the client started
+  sending as soon as it read the 200, its first bytes could be dropped over
+  TLS, leaving a gap in the tunnel or a tunnel that stalled. Over plain TCP the
+  bytes were not lost, but they arrived as a socket message, so code reading
+  the socket directly never saw them. Every byte now reaches the new owner in
+  order, through the returned buffer or the socket. An Upgrade request without
+  the `Connection: upgrade` token had the same problem. Regular upgrades were
+  not affected.
+- A close or socket error that arrived during the handover could be dropped, so
+  the new owner was never told. It now receives it as a socket message.
+- If the 101 response to an Upgrade could not be written, the connection stopped
+  reading and stayed around until its idle timeout, or forever if it had none.
+  It now notices the peer leaving and stops.
+
 ## [0.9.1] - 2026-08-30
 
 ### Fixed
