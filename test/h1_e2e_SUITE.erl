@@ -728,12 +728,18 @@ informational_rejects_mid_response(Config0) ->
     end,
     Config = start_tcp_server(Handler, Config0),
     Port = h1:server_port(?config(server_ref, Config)),
-    {200, _, _} = simple_get(Port),
+    {ok, Sock} = gen_tcp:connect("127.0.0.1", Port,
+                                 [binary, {active, false}, {packet, raw}]),
+    ok = gen_tcp:send(Sock, <<"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n">>),
+    {200, _, _} = recv_http_response(Sock),
+    %% Stay connected until the handler reports: closing on the response head
+    %% stops the connection, and its next call would exit with noproc.
     receive
         {mid_result, RMid} ->
             ?assertEqual({error, response_already_started}, RMid)
     after 5000 -> ct:fail(no_mid_result)
     end,
+    gen_tcp:close(Sock),
     {save_config, Config}.
 
 %% stop_server/1 must close accepted (kept-alive) connections, not just
