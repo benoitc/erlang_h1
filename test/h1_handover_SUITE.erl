@@ -281,7 +281,8 @@ socket_is_passive_after_handover(Config0) ->
     Test = self(),
     Handler = fun(Conn, Id, _M, _P, _Hs) ->
         {ok, T, Sock, _Buf} = h1:accept_connect(Conn, Id, []),
-        Test ! {active, opts_mod(T):getopts(Sock, [active])}
+        Mod = opts_mod(T),
+        Test ! {active, Mod:getopts(Sock, [active])}
     end,
     Config = start_server(Handler, #{}, Config0),
     Transport = sock_mod(Config),
@@ -332,7 +333,8 @@ failed_send(Request, Accept, Config0) ->
     end.
 
 shutdown_write(Sock, Config) ->
-    (sock_mod(Config)):shutdown(Sock, write).
+    Mod = sock_mod(Config),
+    Mod:shutdown(Sock, write).
 
 %% ----------------------------------------------------------------------------
 %% Helpers
