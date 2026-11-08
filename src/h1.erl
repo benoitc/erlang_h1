@@ -37,6 +37,11 @@
 -export([start_server/2, start_server/3, stop_server/1, stop_accepting/1,
          server_port/1]).
 -export([serve_socket/2]).
+
+-ifdef(TEST).
+%% Lets the test suite drive a failed listen socket transfer.
+-export([spawn_listener/4]).
+-endif.
 -export([send_response/4, respond/5, respond/6]).
 -export([send_informational/4]).
 
@@ -298,7 +303,17 @@ spawn_listener(Transport, ListenSocket, Bound, Opts) ->
              server_opts => ServerOpts},
     case h1_sup:start_listener(Args) of
         {ok, Pid} ->
-            {ok, {Pid, Ref, Bound}};
+            %% The listen socket closes when its controlling process exits.
+            %% Hand it to the listener so the server does not depend on the
+            %% caller staying alive.
+            case transfer_socket(Transport, ListenSocket, Pid) of
+                ok ->
+                    {ok, {Pid, Ref, Bound}};
+                {error, Reason} ->
+                    ok = h1_listener:stop(Pid, Ref),
+                    close_socket(Transport, ListenSocket),
+                    {error, {controlling_process, Reason}}
+            end;
         {error, Reason} ->
             close_socket(Transport, ListenSocket),
             {error, Reason}

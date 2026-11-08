@@ -4,6 +4,16 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.9.3] - 2026-11-08
+
+### Fixed
+
+- A server stopped accepting connections as soon as the process that started
+  it exited. The listen socket stayed tied to that process, so starting a
+  server from a short-lived process (an RPC call, a setup script, a test group
+  setup) left a server that refused every new connection. The server now owns
+  its listen socket and keeps serving until you stop it.
+
 ## [0.9.2] - 2026-11-05
 
 ### Fixed
