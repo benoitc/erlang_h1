@@ -12,6 +12,7 @@
 
 -export([server_sees_client_cert/1,
          after_accept_upgrade/1,
+         after_accept_connect/1,
          tls_without_client_cert/1,
          cleartext/1,
          client_sees_server_cert/1]).
@@ -20,6 +21,7 @@ all() ->
     case os:find_executable("openssl") of
         false -> {skip, no_openssl};
         _ -> [server_sees_client_cert, after_accept_upgrade,
+              after_accept_connect,
               tls_without_client_cert, cleartext, client_sees_server_cert]
     end.
 
@@ -55,15 +57,15 @@ server_sees_client_cert(Config) ->
     end.
 
 %% Once accept_upgrade/3 has handed the socket over, the connection process
-%% is gone: peercert/1 answers `{error, closed}' instead of crashing, and the
-%% new owner reads the same certificate from the socket.
+%% is gone and answers `{error, closed}'; peercert/1 on the returned socket
+%% still gives the certificate.
 after_accept_upgrade(Config) ->
     #{client_cert := CliPem, client_key := CliKey} = Certs = ?config(certs, Config),
     Test = self(),
     Handler = fun(Conn, StreamId, _Method, _Path, _Headers) ->
         Before = h1:peercert(Conn),
         {ok, Sock, _Buf} = h1:accept_upgrade(Conn, StreamId, []),
-        Test ! {peercert, Before, h1:peercert(Conn), ssl:peercert(Sock)},
+        Test ! {peercert, Before, h1:peercert(Conn), h1:peercert(Sock)},
         receive done -> ok after 5000 -> ok end
     end,
     Ref = start_mtls_server(Certs, Handler),
@@ -73,12 +75,33 @@ after_accept_upgrade(Config) ->
                               "connection: upgrade\r\nupgrade: test\r\n\r\n">>),
         Der = pem_to_der(CliPem),
         receive
-            {peercert, Before, After, FromSocket} ->
+            {peercert, Before, FromConn, FromSocket} ->
                 ?assertEqual({ok, Der}, Before),
-                ?assertEqual({error, closed}, After),
+                ?assertEqual({error, closed}, FromConn),
                 ?assertEqual({ok, Der}, FromSocket)
         after 5000 -> error(timeout)
         end,
+        _ = ssl:close(Sock)
+    after
+        h1:stop_server(Ref)
+    end.
+
+%% Same for a CONNECT tunnel: the socket accept_connect/3 returns carries
+%% the certificate.
+after_accept_connect(Config) ->
+    #{client_cert := CliPem, client_key := CliKey} = Certs = ?config(certs, Config),
+    Test = self(),
+    Handler = fun(Conn, StreamId, _Method, _Path, _Headers) ->
+        {ok, ssl, Sock, _Buf} = h1:accept_connect(Conn, StreamId, []),
+        Test ! {peercert, h1:peercert(Sock)},
+        receive done -> ok after 5000 -> ok end
+    end,
+    Ref = start_mtls_server(Certs, Handler),
+    try
+        Sock = tls_connect(Ref, [{certfile, CliPem}, {keyfile, CliKey}]),
+        ok = ssl:send(Sock, <<"CONNECT example.com:443 HTTP/1.1\r\n"
+                              "host: example.com:443\r\n\r\n">>),
+        ?assertEqual({ok, pem_to_der(CliPem)}, receive_peercert()),
         _ = ssl:close(Sock)
     after
         h1:stop_server(Ref)

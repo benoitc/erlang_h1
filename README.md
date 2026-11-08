@@ -532,10 +532,15 @@ handle(Conn, StreamId, _Method, _Path, _Headers) ->
 ```
 
 It returns `{error, no_peercert}` over plain TCP or when the client sent no
-certificate. Call it before `h1:accept_upgrade/3` or `h1:accept_connect/3`:
-once the socket is handed over the connection is gone and it returns
-`{error, closed}`; use `ssl:peercert/1` on the returned socket instead. On a
-client connection it returns the server's certificate.
+certificate. After `h1:accept_upgrade/3` or `h1:accept_connect/3` hand the
+socket over, the connection is gone: pass the returned socket instead.
+
+```erlang
+{ok, Sock, _Buf} = h1:accept_upgrade(Conn, StreamId, []),
+{ok, Der} = h1:peercert(Sock).
+```
+
+On a client connection it returns the server's certificate.
 
 ## Tuning
 

@@ -516,14 +516,16 @@ peername(Conn) -> h1_connection:peername(Conn).
 
 %% @doc DER-encoded certificate the peer presented in the TLS handshake:
 %% the client's certificate on a server connection, the server's on a
-%% client connection. Read once when the connection starts.
+%% client connection.
+%%
+%% Pass the connection, or the socket that `accept_upgrade/3' or
+%% `accept_connect/3,4' returned once the socket was handed over (the
+%% connection process is gone by then and answers `{error, closed}').
 %%
 %% A client only sends a certificate when the server asks for one: start
 %% the server with `verify => verify_peer' and `cacerts'. Returns
 %% `{error, no_peercert}' when the peer sent none or the connection is
-%% plain TCP, and `{error, closed}' once the connection process is gone,
-%% which includes after `accept_upgrade/3' or `accept_connect/3' handed
-%% the socket over (call `ssl:peercert/1' on the returned socket then).
+%% plain TCP.
 %%
 %% ```
 %% handle(Conn, StreamId, _Method, _Path, _Headers) ->
@@ -532,8 +534,15 @@ peername(Conn) -> h1_connection:peername(Conn).
 %%         {error, _} -> h1:respond(Conn, StreamId, 403, [], <<>>)
 %%     end.
 %% '''
--spec peercert(connection()) -> {ok, binary()} | {error, term()}.
-peercert(Conn) -> h1_connection:peercert(Conn).
+-spec peercert(connection() | ssl:sslsocket() | gen_tcp:socket()) ->
+    {ok, binary()} | {error, term()}.
+peercert(Conn) when is_pid(Conn) ->
+    h1_connection:peercert(Conn);
+peercert(Socket) ->
+    case h1_connection:transport_of(Socket) of
+        ssl -> ssl:peercert(Socket);
+        gen_tcp -> {error, no_peercert}
+    end.
 
 -spec controlling_process(connection(), pid()) -> ok | {error, term()}.
 controlling_process(Conn, Pid) ->
