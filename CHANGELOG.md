@@ -4,6 +4,16 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.10.0] - 2026-11-08
+
+### Added
+
+- `h1:peercert/1` returns the certificate the peer presented during the TLS
+  handshake. A server handler can now read the client's certificate and
+  authorize the request by mutual TLS; on a client connection it returns the
+  server's certificate. The server has to ask for client certificates
+  (`verify_peer` with `cacerts`) for one to be sent.
+
 ## [0.9.3] - 2026-11-08
 
 ### Fixed

@@ -35,7 +35,7 @@
 -export([send_trailers/3]).
 -export([continue/2]).
 -export([send_informational/4]).
--export([peername/1]).
+-export([peername/1, peercert/1]).
 -export([upgrade/3, upgrade/4]).
 -export([accept_upgrade/3]).
 -export([accept_connect/3, accept_connect/4]).
@@ -106,6 +106,9 @@
     owner                  :: pid(),
     owner_ref              :: reference(),
     peer                   :: {inet:ip_address(), inet:port_number()} | undefined,
+    %% Certificate the peer presented in the TLS handshake, read once at
+    %% start so it does not depend on the socket afterwards.
+    peercert = {error, closed} :: {ok, binary()} | {error, term()},
     %% Client-side: hostname (or IP literal) used to build the default
     %% `Host:' header when the caller omits it.
     peer_host              :: undefined | binary(),
@@ -228,6 +231,19 @@ send_informational(Pid, StreamId, Status, Headers) ->
 peername(Pid) ->
     gen_statem:call(Pid, peername).
 
+%% @doc DER certificate the peer presented in the TLS handshake, recorded
+%% when the connection process started. `{error, no_peercert}' over plain
+%% TCP or when the peer sent none; `{error, closed}' once the connection
+%% process is gone (for example after the socket was handed over).
+peercert(Pid) ->
+    try gen_statem:call(Pid, peercert)
+    catch exit:{Reason, _} when Reason =:= noproc; Reason =:= normal;
+                                Reason =:= shutdown ->
+              {error, closed};
+          exit:{{shutdown, _}, _} ->
+              {error, closed}
+    end.
+
 %% @doc Client: send an Upgrade request and block until either 101 arrives
 %% (returning the raw socket) or a non-101 response is received.
 upgrade(Pid, Protocol, Headers) ->
@@ -329,6 +345,7 @@ init({Mode, Socket, Owner, Opts}) ->
         owner = Owner,
         owner_ref = Ref,
         peer = Peer,
+        peercert = sock_peercert(Transport, Socket),
         peer_host = PeerHost,
         parser = Parser,
         parser_opts = ParserOpts,
@@ -573,6 +590,8 @@ handle_event({call, From}, peername, _S, #state{peer = undefined}) ->
     {keep_state_and_data, [{reply, From, {error, closed}}]};
 handle_event({call, From}, peername, _S, #state{peer = Peer}) ->
     {keep_state_and_data, [{reply, From, {ok, Peer}}]};
+handle_event({call, From}, peercert, _S, #state{peercert = Cert}) ->
+    {keep_state_and_data, [{reply, From, Cert}]};
 
 handle_event({call, From}, get_settings, _S, _State) ->
     {keep_state_and_data, [{reply, From, #{}}]};
@@ -638,6 +657,9 @@ sock_send(#state{transport = ssl,    socket = S}, Data) -> ssl:send(S, Data).
 
 sock_peername(gen_tcp, S) -> inet:peername(S);
 sock_peername(ssl, S)     -> ssl:peername(S).
+
+sock_peercert(gen_tcp, _S) -> {error, no_peercert};
+sock_peercert(ssl, S)      -> ssl:peercert(S).
 
 close_socket(gen_tcp, S) -> gen_tcp:close(S);
 close_socket(ssl, S)     -> ssl:close(S).
