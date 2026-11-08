@@ -146,6 +146,7 @@ must not lose bytes or close events queued in the mailbox.
 - `test/h1_*_SUITE.erl`: Common Test. `h1_e2e_SUITE` (real client and server
   over TCP and TLS), `h1_compliance_SUITE` (RFC 9110/9112 rules),
   `h1_handover_SUITE` (bytes and close events across socket handoff),
+  `h1_listener_owner_SUITE` (a server outlives the process that started it),
   `h1_connect_SUITE`, `h1_upgrade_SUITE`, `h1_serve_socket_SUITE`,
   `h1_ranch_SUITE` (with `h1_ranch_protocol`), `h1_interop_SUITE`
 - Regression tests for wire bugs drive a raw `gen_tcp` peer and assert exact
