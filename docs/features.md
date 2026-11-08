@@ -101,6 +101,7 @@ h1:pipeline/2
 h1:get_settings/1
 h1:get_peer_settings/1
 h1:peername/1
+h1:peercert/1
 ```
 
 The export list mirrors `h2` and `quic_h3` where semantics overlap. H1-specific primitives (`upgrade`, `accept_upgrade`, `continue`, `pipeline`) cover what h2 and h3 have no equivalent of.

@@ -34,11 +34,11 @@ was already taken on hex.pm). The OTP application and module atom stay
 
 ```erlang
 %% rebar.config — from hex
-{deps, [{erlang_h1, "0.9.3"}]}.
+{deps, [{erlang_h1, "0.10.0"}]}.
 
 %% Or directly from git
 {deps, [
-    {erlang_h1, {git, "https://github.com/benoitc/erlang_h1.git", {tag, "0.9.3"}}}
+    {erlang_h1, {git, "https://github.com/benoitc/erlang_h1.git", {tag, "0.10.0"}}}
 ]}.
 ```
 
@@ -513,6 +513,29 @@ client authentication silently disabled. It also implies
 `fail_if_no_peer_cert`, so a client that presents no certificate is rejected on
 TLS 1.2 as well as 1.3. Pass `{fail_if_no_peer_cert, false}` in `ssl_opts` if
 you want optional client certificates.
+
+### Reading the client certificate
+
+Call `h1:peercert/1` from the handler to get the certificate the client
+presented, DER-encoded. A client only sends one when the server asks for it
+(`verify => verify_peer` plus `cacerts`, as above).
+
+```erlang
+handle(Conn, StreamId, _Method, _Path, _Headers) ->
+    case h1:peercert(Conn) of
+        {ok, Der} ->
+            Cert = public_key:pkix_decode_cert(Der, otp),
+            authorize(Conn, StreamId, Cert);
+        {error, no_peercert} ->
+            h1:respond(Conn, StreamId, 403, [], <<>>)
+    end.
+```
+
+It returns `{error, no_peercert}` over plain TCP or when the client sent no
+certificate. Call it before `h1:accept_upgrade/3` or `h1:accept_connect/3`:
+once the socket is handed over the connection is gone and it returns
+`{error, closed}`; use `ssl:peercert/1` on the returned socket instead. On a
+client connection it returns the server's certificate.
 
 ## Tuning
 
