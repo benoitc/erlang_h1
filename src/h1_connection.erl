@@ -190,7 +190,8 @@ send_request_with_body(Pid, Method, Path, Headers, Body) ->
 %% @doc Server: send a response header block. If Headers does not
 %% include Content-Length or Transfer-Encoding, the caller is expected
 %% to follow up with chunked send_data/4 + send_trailers/3 / send_data
-%% with end_stream=true.
+%% with end_stream=true. A response to HEAD, a 204 or a 304 gets no body
+%% framing and no body bytes; a 1xx is sent as an interim response.
 send_response(Pid, StreamId, Status, Headers) ->
     gen_statem:call(Pid, {send_response, StreamId, Status, Headers, #{}}).
 
@@ -1266,6 +1267,11 @@ maybe_flush_pending_body(Id, State) ->
 %% Server: send_response, send_data, send_trailers, continue
 %% ----------------------------------------------------------------------------
 
+handle_send_response(From, StreamId, Status, Headers, State0)
+  when Status >= 100, Status =< 199 ->
+    %% A 1xx is interim, not the final response: same path and rules as
+    %% send_informational/4 (RFC 9110 §15.2).
+    handle_send_informational(From, StreamId, Status, Headers, State0);
 handle_send_response(From, StreamId, Status, Headers, State0) ->
     %% Sending a normal response on an upgrade-pending connection means the
     %% handler declined the Upgrade. Drop the pending flag and resume
@@ -1280,7 +1286,8 @@ handle_send_response(From, StreamId, Status, Headers, State0) ->
             %% close after this response — commit Connection: close now,
             %% before any send_data, so it is in the header block.
             State0b = maybe_set_early_close(StreamId, State),
-            {Framing, HeadersWire} = prepare_response(Headers, no_body, State0b),
+            {Framing, HeadersWire} =
+                prepare_response(Stream, Status, Headers, no_body, State0b),
             Stream1 = Stream#stream{status = Status, resp_headers = Headers,
                                     resp_framing = Framing, state = open},
             Wire = [h1_message:status_line(Status, ?HTTP_1_1),
@@ -1300,6 +1307,11 @@ handle_send_response(From, StreamId, Status, Headers, State0) ->
 %% Send status line, headers, and body in a single socket write, then end
 %% the stream. Coalesces what send_response/4 + send_data/4 would do as two
 %% writes, framing the body with Content-Length.
+handle_respond(From, StreamId, Status, Headers0, _Body, _Opts, State0)
+  when Status >= 100, Status =< 199 ->
+    %% Interim response: a 1xx carries no content (RFC 9112 §6.3), so the
+    %% body is dropped and the stream waits for the final response.
+    handle_send_informational(From, StreamId, Status, Headers0, State0);
 handle_respond(From, StreamId, Status, Headers0, Body, Opts, State0) ->
     {State, ResumeActions} = case State0#state.upgrade_pending of
         true  -> {set_active_once(State0#state{upgrade_pending = false}), []};
@@ -1314,7 +1326,8 @@ handle_respond(From, StreamId, Status, Headers0, Body, Opts, State0) ->
             %% fully received: advertise Connection: close and linger-close
             %% (RFC 9112 §6.6) so the client reads the response before FIN.
             State0b = maybe_set_early_close(StreamId, State),
-            {Framing, HeadersWire} = prepare_response(Headers0, Body, State0b),
+            {Framing, HeadersWire} =
+                prepare_response(Stream, Status, Headers0, Body, State0b),
             BodyWire = frame_body(Stream#stream{resp_framing = Framing}, Body, true),
             Wire = [h1_message:status_line(Status, ?HTTP_1_1),
                     h1_message:headers(HeadersWire),
@@ -1401,6 +1414,52 @@ drain_discard(Data, #state{drain_left = Left} = State) ->
             {stop, {shutdown, drain_budget_exhausted}, State}
     end.
 
+%% A response to HEAD and any 1xx, 204 or 304 ends at the blank line after
+%% its header block, whatever its framing headers say (RFC 9112 §6.3 item 1,
+%% RFC 9110 §6.4.1). Such a response gets `no_body' framing: nothing written
+%% after the header block, so the next response on the connection starts
+%% right there.
+prepare_response(#stream{method = Method}, Status, Headers, Body, State) ->
+    case bodyless(Method, Status) of
+        true  -> prepare_bodyless(Method, Status, Headers, Body, State);
+        false -> prepare_response(Headers, Body, State)
+    end.
+
+bodyless(<<"HEAD">>, _Status) -> true;
+bodyless(_Method, Status) when Status >= 100, Status =< 199 -> true;
+bodyless(_Method, 204) -> true;
+bodyless(_Method, 304) -> true;
+bodyless(_Method, _Status) -> false.
+
+%% No Transfer-Encoding on any of them (RFC 9112 §6.1 forbids it on 1xx and
+%% 204, and there is no body to encode). No Content-Length on 1xx and 204
+%% (RFC 9110 §8.6). On 304 and HEAD a caller-set Content-Length is kept as
+%% metadata. A HEAD answered through respond/5 with the GET body gets the
+%% Content-Length a GET would get (RFC 9110 §9.3.2); an empty body says
+%% nothing about that length, and a 304's body is not the representation, so
+%% neither gets one.
+prepare_bodyless(Method, Status, Headers, Body, #state{close_after = CloseAfter}) ->
+    {CL, _TE, HasConn} = scan_response_headers(Headers),
+    Headers1 = strip_framing(Status, Headers),
+    Headers2 = case {Method, Status, CL, Body} of
+        {<<"HEAD">>, S, undefined, B} when S =/= 204, S =/= 304, B =/= no_body ->
+            case iolist_size(B) of
+                0 -> Headers1;
+                N -> Headers1 ++ [{<<"content-length">>, integer_to_binary(N)}]
+            end;
+        _ ->
+            Headers1
+    end,
+    {no_body, ensure_close(Headers2, HasConn, CloseAfter)}.
+
+strip_framing(Status, Headers) ->
+    DropCL = Status =:= 204 orelse (Status >= 100 andalso Status =< 199),
+    [H || {N, _} = H <- Headers, keep_framing_header(h1_parse_erl:to_lower(N), DropCL)].
+
+keep_framing_header(<<"transfer-encoding">>, _DropCL) -> false;
+keep_framing_header(<<"content-length">>, DropCL) -> not DropCL;
+keep_framing_header(_Name, _DropCL) -> true.
+
 %% Decide framing and build the response header block in a single pass over
 %% the caller's headers, instead of rescanning (and re-lowercasing every
 %% name) once per decision. `Body' is `no_body' for a header-only send, or
@@ -1473,8 +1532,7 @@ ensure_close(Headers, _HasConn, _CloseAfter) ->
 handle_send_data(From, StreamId, Data, EndStream, State) ->
     case maps:find(StreamId, State#state.streams) of
         {ok, Stream} ->
-            Wire = frame_body(Stream, Data, EndStream),
-            case sock_send(State, Wire) of
+            case send_body(State, Stream, Data, EndStream) of
                 ok ->
                     Stream1 = case EndStream of
                         true -> Stream#stream{state = half_closed_local};
@@ -1489,6 +1547,13 @@ handle_send_data(From, StreamId, Data, EndStream, State) ->
         error ->
             {keep_state_and_data, [{reply, From, {error, unknown_stream}}]}
     end.
+
+%% Body data offered for a bodyless response (HEAD, 204, 304) is dropped:
+%% nothing may follow its header block (RFC 9112 §6.3).
+send_body(_State, #stream{resp_framing = no_body}, _Data, _EndStream) ->
+    ok;
+send_body(State, Stream, Data, EndStream) ->
+    sock_send(State, frame_body(Stream, Data, EndStream)).
 
 frame_body(#stream{resp_framing = chunked}, Data, EndStream) ->
     Chunk = h1_message:encode_chunk(Data),
@@ -1530,6 +1595,12 @@ handle_send_trailers(From, StreamId, Trailers, State) ->
                 {error, R} ->
                     {keep_state_and_data, [{reply, From, {error, R}}]}
             end;
+        {ok, #stream{resp_framing = no_body} = Stream} ->
+            %% A bodyless response has no trailer section (RFC 9112 §6.3):
+            %% drop the trailers and end the stream as send_data/4 would.
+            State1 = put_stream(Stream#stream{state = half_closed_local}, State),
+            State2 = maybe_close_server_stream(StreamId, State1),
+            finish_server_send(From, StreamId, [], State2);
         {ok, _} ->
             {keep_state_and_data,
              [{reply, From, {error, trailers_require_chunked}}]};
@@ -1550,8 +1621,10 @@ handle_send_informational(From, StreamId, Status, Headers, State) ->
         {ok, #stream{version = ?HTTP_1_0}} ->
             {keep_state_and_data, [{reply, From, {error, http_1_0}}]};
         {ok, #stream{status = undefined} = Stream} ->
+            %% A 1xx ends at its header block: no Content-Length or
+            %% Transfer-Encoding (RFC 9110 §8.6, RFC 9112 §6.1).
             Wire = [h1_message:status_line(Status, ?HTTP_1_1),
-                    h1_message:headers(Headers),
+                    h1_message:headers(strip_framing(Status, Headers)),
                     <<"\r\n">>],
             case sock_send(State, Wire) of
                 ok ->

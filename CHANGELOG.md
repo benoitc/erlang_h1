@@ -4,6 +4,20 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.10.1] - 2026-11-11
+
+### Fixed
+
+- A server response with no body (a 204, a 304, a 1xx, or any answer to a
+  HEAD request) could be sent with chunked framing and a stray end-of-body
+  marker. On a kept-alive connection the client then read those bytes as the
+  start of the next response and failed it; browsers reported an invalid
+  response, for example on the request after a CORS preflight. These
+  responses now end at their headers, a 204 or 1xx no longer carries a
+  `Content-Length`, and any body or trailers you send for them are dropped.
+  Answering HEAD with the body you would send for GET now gives the right
+  `Content-Length` and no body.
+
 ## [0.10.0] - 2026-11-08
 
 ### Added
