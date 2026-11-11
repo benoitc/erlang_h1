@@ -142,12 +142,14 @@ must not lose bytes or close events queued in the mailbox.
 
 - Internals are tested in-module under `-ifdef(TEST)` (`h1_parse_erl`,
   `h1_capsule`, `h1_varint`, `h1_error`)
-- `test/h1_prop_tests.erl`: PropEr properties (encode/decode roundtrips)
+- `test/h1_prop_tests.erl`: PropEr properties (encode/decode roundtrips, and
+  bodyless response framing, run from `h1_bodyless_SUITE`)
 - `test/h1_*_SUITE.erl`: Common Test. `h1_e2e_SUITE` (real client and server
   over TCP and TLS), `h1_compliance_SUITE` (RFC 9110/9112 rules),
   `h1_handover_SUITE` (bytes and close events across socket handoff),
   `h1_listener_owner_SUITE` (a server outlives the process that started it),
   `h1_peercert_SUITE` (TLS peer certificate),
+  `h1_bodyless_SUITE` (HEAD / 1xx / 204 / 304 framing on both sides),
   `h1_connect_SUITE`, `h1_upgrade_SUITE`, `h1_serve_socket_SUITE`,
   `h1_ranch_SUITE` (with `h1_ranch_protocol`), `h1_interop_SUITE`
 - Regression tests for wire bugs drive a raw `gen_tcp` peer and assert exact

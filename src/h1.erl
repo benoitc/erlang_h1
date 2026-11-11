@@ -413,6 +413,17 @@ server_port({_, _, Port}) -> Port.
 
 -spec send_response(connection(), stream_id(), status(), headers()) ->
     ok | {error, term()}.
+%% @doc Server: send the response header block. When the headers carry
+%% neither Content-Length nor Transfer-Encoding, the body is sent chunked.
+%% Follow up with send_data/4 and end the stream with `EndStream = true' or
+%% with send_trailers/3.
+%%
+%% A response to HEAD and any 204 or 304 has no body (RFC 9112 §6.3): h1
+%% drops any Transfer-Encoding, drops Content-Length on a 204, keeps one you
+%% set on a 304 or HEAD response, and writes nothing after the header block.
+%% Body data and trailers you send afterwards are discarded and the calls
+%% return `ok'; end the stream as usual. A 1xx status is sent as an interim
+%% response, as with send_informational/4.
 send_response(Conn, StreamId, Status, Headers) ->
     h1_connection:send_response(Conn, StreamId, Status, Headers).
 
@@ -423,6 +434,11 @@ send_response(Conn, StreamId, Status, Headers) ->
 %% the headers carry neither Content-Length nor Transfer-Encoding, so the
 %% body is sent fixed-length rather than chunked. Use this for fully-known
 %% bodies; use send_response/4 + send_data/4 for streaming.
+%%
+%% For a response to HEAD, a 204 or a 304 the body is not sent, as for
+%% send_response/4. On HEAD the Content-Length is that of `Body', so a GET
+%% handler can answer HEAD unchanged; an empty `Body' adds none. A 1xx status
+%% is sent as an interim response and the body is discarded.
 %%
 %% If the request body has not been fully received when this is called (an
 %% early response, e.g. rejecting an oversized upload with 413), h1 adds
@@ -455,12 +471,16 @@ send_data(Conn, StreamId, Data) ->
 %% @doc Send a body chunk. With `EndStream = true' the stream is ended; if the
 %% request body was not fully received first (server side), h1 advertises
 %% `Connection: close' and drains the remaining inbound body before closing,
-%% as for respond/5.
+%% as for respond/5. On a response with no body (HEAD, 204, 304) `Data' is
+%% discarded and nothing is written.
 send_data(Conn, StreamId, Data, EndStream) ->
     h1_connection:send_data(Conn, StreamId, Data, EndStream).
 
 -spec send_trailers(connection(), stream_id(), headers()) ->
     ok | {error, term()}.
+%% @doc Send the trailer section and end the stream. The response must be
+%% chunked, else `{error, trailers_require_chunked}'. On a response with no
+%% body (HEAD, 204, 304) the trailers are discarded and the stream ends.
 send_trailers(Conn, StreamId, Trailers) ->
     h1_connection:send_trailers(Conn, StreamId, Trailers).
 
