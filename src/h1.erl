@@ -424,6 +424,10 @@ server_port({_, _, Port}) -> Port.
 %% Body data and trailers you send afterwards are discarded and the calls
 %% return `ok'; end the stream as usual. A 1xx status is sent as an interim
 %% response, as with send_informational/4.
+%%
+%% A `Connection: close' you set makes this the last response: h1 closes the
+%% connection once it ends and does not process later requests. The same
+%% holds for respond/5,6.
 send_response(Conn, StreamId, Status, Headers) ->
     h1_connection:send_response(Conn, StreamId, Status, Headers).
 
@@ -481,6 +485,8 @@ send_data(Conn, StreamId, Data, EndStream) ->
 %% @doc Send the trailer section and end the stream. The response must be
 %% chunked, else `{error, trailers_require_chunked}'. On a response with no
 %% body (HEAD, 204, 304) the trailers are discarded and the stream ends.
+%% Ending the stream here works like send_data/4 with `EndStream = true': a
+%% pending close or early-response drain runs after the trailers.
 send_trailers(Conn, StreamId, Trailers) ->
     h1_connection:send_trailers(Conn, StreamId, Trailers).
 

@@ -17,6 +17,19 @@ follow [Semantic Versioning](https://semver.org/).
   `Content-Length`, and any body or trailers you send for them are dropped.
   Answering HEAD with the body you would send for GET now gives the right
   `Content-Length` and no body.
+- A handler that answered with `Connection: close` did not close the
+  connection. The client stopped using it, but the server kept the socket
+  open until the idle timeout. The server now closes the connection after
+  that response.
+- A client that pipelined several requests and marked a later one with
+  `Connection: close` lost that request. The server closed the connection
+  after the response it was sending at the time, so the request asking to
+  close was never answered. The server now answers every request up to and
+  including that one, then closes. Requests sent after it are not processed.
+- A response ended with trailers left its request behind in the connection,
+  one per request on a kept-alive connection, and ignored a pending close, so
+  the connection stayed open after the last response. Trailers now end the
+  response the same way as the last chunk of data.
 
 ## [0.10.0] - 2026-11-08
 

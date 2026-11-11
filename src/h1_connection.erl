@@ -140,9 +140,19 @@
     drain_left             :: undefined | non_neg_integer() | infinity,
     %% Upgrade handoff (synchronous server-side accept).
     upgrade_accept         :: undefined | {pid(), reference(), stream_id()},
-    %% Shutdown policy.
+    %% Shutdown policy. `close_after': close once the response in progress
+    %% is done (goaway, cancel, parse error, early response).
     close_after = false    :: boolean(),
     goaway_sent = false    :: boolean(),
+    %% Server: the stream whose response is the last on this connection,
+    %% set by a request or a response carrying `Connection: close'
+    %% (RFC 9112 §9.6). Once its request is read, later input is discarded.
+    close_stream           :: undefined | stream_id(),
+    reading = parse        :: parse | discard,
+    %% Server: input past the last request was read or discarded, so the
+    %% close must be staged (lingering close) to avoid a reset.
+    unread = false         :: boolean(),
+    discarded = 0          :: non_neg_integer(),
     %% Connection lifecycle.
     connected_acked = false :: boolean(),
     wait_connected_waiters = [] :: [gen_statem:from()],
@@ -706,6 +716,8 @@ clear_request_timeout() ->
 %% Parser drive
 %% ----------------------------------------------------------------------------
 
+handle_socket_data(Data, #state{mode = server, reading = discard} = State) ->
+    discard_input(Data, State);
 handle_socket_data(Data, #state{parser = P, mode = Mode} = State) ->
     case drive_parser(h1_parse_erl:execute(P, Data), State, Mode) of
         {ok, #state{upgrade_pending = true} = State1} ->
@@ -930,7 +942,7 @@ on_request_headers_complete(Stream1, Headers, State, Id) ->
             State1 = put_stream(Stream2, State),
             %% Resolve keep-alive/close policy before handing the request
             %% to the owner so the handler observes a consistent state.
-            State2 = apply_peer_connection_policy(State1, Headers,
+            State2 = apply_request_close_policy(State1, Id, Headers,
                         Stream1#stream.version),
             notify(State2#state.owner,
                    {request, Id, Stream1#stream.method,
@@ -995,7 +1007,25 @@ has_token(Header, Token) ->
     lists:member(Token, Parts).
 
 apply_peer_connection_policy(State, Headers, Version) ->
-    Close = case lookup_ci(<<"connection">>, Headers) of
+    Close = peer_asks_close(Headers, Version),
+    State#state{keepalive = not Close,
+                close_after = State#state.close_after orelse Close}.
+
+%% Server: a request asking to close makes its own response the last one
+%% (RFC 9112 §9.6). Responses to earlier pipelined requests keep the
+%% connection open; requests after it are not processed.
+apply_request_close_policy(State, Id, Headers, Version) ->
+    case peer_asks_close(Headers, Version) of
+        true when State#state.close_stream =:= undefined ->
+            State#state{keepalive = false, close_stream = Id};
+        true ->
+            State#state{keepalive = false};
+        false ->
+            State
+    end.
+
+peer_asks_close(Headers, Version) ->
+    case lookup_ci(<<"connection">>, Headers) of
         undefined -> Version =:= ?HTTP_1_0;
         Conn ->
             Lowered = h1_parse_erl:to_lower(Conn),
@@ -1008,9 +1038,7 @@ apply_peer_connection_policy(State, Headers, Version) ->
                         _ -> true
                     end
             end
-    end,
-    State#state{keepalive = not Close,
-                close_after = State#state.close_after orelse Close}.
+    end.
 
 deliver_data(Chunk, EndStream, #state{current_stream = Id} = State)
     when Id =/= undefined ->
@@ -1048,9 +1076,15 @@ flush_handler(#stream{recv_buffer = Buf} = _Stream, Handler)
 after_message_done(Rest, #state{mode = server, current_stream = Id} = State) ->
     State1 = finalize_request(Id, State),
     State2 = State1#state{parser = reset_parser(State1), current_stream = undefined},
-    case byte_size(Rest) > 0 of
-        true -> drive_parser(h1_parse_erl:execute(State2#state.parser, Rest), State2, server);
-        false -> {ok, State2}
+    if
+        Id =:= State2#state.close_stream ->
+            %% Last request on this connection: do not process anything
+            %% after it (RFC 9112 §9.6).
+            {ok, stop_reading(Rest =/= <<>>, State2)};
+        byte_size(Rest) > 0 ->
+            drive_parser(h1_parse_erl:execute(State2#state.parser, Rest), State2, server);
+        true ->
+            {ok, State2}
     end;
 after_message_done(Rest, #state{mode = client, current_stream = Id} = State) ->
     State1 = finalize_response(Id, State),
@@ -1286,7 +1320,7 @@ handle_send_response(From, StreamId, Status, Headers, State0) ->
             %% close after this response — commit Connection: close now,
             %% before any send_data, so it is in the header block.
             State0b = maybe_set_early_close(StreamId, State),
-            {Framing, HeadersWire} =
+            {Framing, HeadersWire, Close} =
                 prepare_response(Stream, Status, Headers, no_body, State0b),
             Stream1 = Stream#stream{status = Status, resp_headers = Headers,
                                     resp_framing = Framing, state = open},
@@ -1295,7 +1329,8 @@ handle_send_response(From, StreamId, Status, Headers, State0) ->
                     <<"\r\n">>],
             case sock_send(State0b, Wire) of
                 ok ->
-                    State1 = put_stream(Stream1, State0b),
+                    State1 = handler_close(Close, StreamId,
+                                           put_stream(Stream1, State0b)),
                     {keep_state, State1, [{reply, From, ok} | ResumeActions]};
                 {error, R} ->
                     {keep_state_and_data, [{reply, From, {error, R}}]}
@@ -1326,7 +1361,7 @@ handle_respond(From, StreamId, Status, Headers0, Body, Opts, State0) ->
             %% fully received: advertise Connection: close and linger-close
             %% (RFC 9112 §6.6) so the client reads the response before FIN.
             State0b = maybe_set_early_close(StreamId, State),
-            {Framing, HeadersWire} =
+            {Framing, HeadersWire, Close} =
                 prepare_response(Stream, Status, Headers0, Body, State0b),
             BodyWire = frame_body(Stream#stream{resp_framing = Framing}, Body, true),
             Wire = [h1_message:status_line(Status, ?HTTP_1_1),
@@ -1338,7 +1373,8 @@ handle_respond(From, StreamId, Status, Headers0, Body, Opts, State0) ->
                     Stream1 = Stream#stream{status = Status, resp_headers = Headers0,
                                             resp_framing = Framing,
                                             state = half_closed_local},
-                    State1 = put_stream(Stream1, State0b),
+                    State1 = handler_close(Close, StreamId,
+                                           put_stream(Stream1, State0b)),
                     State2 = maybe_close_server_stream(StreamId, State1),
                     finish_server_send(From, StreamId, ResumeActions,
                                        Budget, State2);
@@ -1377,11 +1413,71 @@ finish_server_send(From, StreamId, ResumeActions, Budget, State) ->
     case maps:find(StreamId, State#state.streams) of
         {ok, #stream{state = closed}} when State#state.mode =:= server ->
             enter_lingering_close(Actions, Budget, State);
-        error when State#state.close_after andalso State#state.mode =:= server ->
-            {stop_and_reply, {shutdown, goaway_sent}, Actions, State};
+        error when State#state.mode =:= server ->
+            case closes_after(StreamId, State) of
+                %% Input past the last request is waiting: stage the close
+                %% so a reset cannot wipe out this response (RFC 9112 §9.6).
+                true when State#state.unread ->
+                    enter_lingering_close(Actions, Budget, State);
+                true ->
+                    {stop_and_reply, {shutdown, goaway_sent}, Actions, State};
+                false ->
+                    {keep_state, State, Actions}
+            end;
         _ ->
             {keep_state, State, Actions}
     end.
+
+%% The handler's own `Connection: close' makes this response the last.
+handler_close(true, StreamId, State) -> mark_close_stream(StreamId, State);
+handler_close(false, _StreamId, State) -> State.
+
+%% True when the response on StreamId is the last on this connection.
+closes_after(StreamId, #state{close_after = CloseAfter, close_stream = Last}) ->
+    CloseAfter orelse StreamId =:= Last.
+
+%% A response carrying `Connection: close' is the last one on this
+%% connection (RFC 9112 §9.6). An earlier last stream stays the last.
+mark_close_stream(Id, #state{close_stream = Last} = State)
+  when is_integer(Last), Last =< Id ->
+    State;
+mark_close_stream(Id, #state{streams = Streams} = State) ->
+    State1 = State#state{close_stream = Id},
+    case maps:find(Id, Streams) of
+        {ok, #stream{recv_ended = false}} ->
+            %% Its request is still arriving; reading stops once it is done.
+            State1;
+        _ ->
+            Later = lists:any(fun(K) -> K > Id end, maps:keys(Streams))
+                    orelse parser_holds_input(State1),
+            stop_reading(Later, State1)
+    end.
+
+parser_holds_input(#state{parser = P}) ->
+    case h1_parse_erl:get(P, buffer) of
+        B when is_binary(B), B =/= <<>> -> true;
+        _ -> false
+    end.
+
+%% After the last request, input is read and discarded instead of parsed.
+%% Reading goes on so the close knows whether input is waiting, within the
+%% early-response drain byte budget.
+stop_reading(Unread, State) ->
+    State#state{reading = discard, unread = State#state.unread orelse Unread}.
+
+discard_input(Data, #state{discarded = D} = State) ->
+    D1 = D + byte_size(Data),
+    State1 = State#state{unread = true, discarded = D1},
+    case discard_limit(State1#state.drain_budget) of
+        Max when Max =:= infinity; D1 < Max ->
+            {keep_state, set_active_once(State1)};
+        _ ->
+            %% Over budget: stop reading and let the kernel push back.
+            {keep_state, State1}
+    end.
+
+discard_limit({MaxBytes, _MaxMs}) -> MaxBytes;
+discard_limit(disabled) -> 0.
 
 %% Send FIN now that the full response is on the wire, then read and discard
 %% the rest of the inbound body until the peer closes, the byte budget runs
@@ -1419,10 +1515,15 @@ drain_discard(Data, #state{drain_left = Left} = State) ->
 %% RFC 9110 §6.4.1). Such a response gets `no_body' framing: nothing written
 %% after the header block, so the next response on the connection starts
 %% right there.
-prepare_response(#stream{method = Method}, Status, Headers, Body, State) ->
+%%
+%% Returns `{Framing, HeadersWire, Close}': `Close' is true when the
+%% caller's own `Connection' header carries `close'. `Connection: close' is
+%% added when this response is the last on the connection.
+prepare_response(#stream{id = Id, method = Method}, Status, Headers, Body, State) ->
+    CloseAfter = closes_after(Id, State),
     case bodyless(Method, Status) of
-        true  -> prepare_bodyless(Method, Status, Headers, Body, State);
-        false -> prepare_response(Headers, Body, State)
+        true  -> prepare_bodyless(Method, Status, Headers, Body, CloseAfter);
+        false -> prepare_response(Headers, Body, CloseAfter)
     end.
 
 bodyless(<<"HEAD">>, _Status) -> true;
@@ -1438,8 +1539,8 @@ bodyless(_Method, _Status) -> false.
 %% Content-Length a GET would get (RFC 9110 §9.3.2); an empty body says
 %% nothing about that length, and a 304's body is not the representation, so
 %% neither gets one.
-prepare_bodyless(Method, Status, Headers, Body, #state{close_after = CloseAfter}) ->
-    {CL, _TE, HasConn} = scan_response_headers(Headers),
+prepare_bodyless(Method, Status, Headers, Body, CloseAfter) ->
+    {CL, _TE, HasConn, Close} = scan_response_headers(Headers),
     Headers1 = strip_framing(Status, Headers),
     Headers2 = case {Method, Status, CL, Body} of
         {<<"HEAD">>, S, undefined, B} when S =/= 204, S =/= 304, B =/= no_body ->
@@ -1450,7 +1551,7 @@ prepare_bodyless(Method, Status, Headers, Body, #state{close_after = CloseAfter}
         _ ->
             Headers1
     end,
-    {no_body, ensure_close(Headers2, HasConn, CloseAfter)}.
+    {no_body, ensure_close(Headers2, HasConn, CloseAfter), Close}.
 
 strip_framing(Status, Headers) ->
     DropCL = Status =:= 204 orelse (Status >= 100 andalso Status =< 199),
@@ -1465,8 +1566,8 @@ keep_framing_header(_Name, _DropCL) -> true.
 %% name) once per decision. `Body' is `no_body' for a header-only send, or
 %% the body iodata for a coalesced respond (used to add Content-Length when
 %% the caller set no framing header).
-prepare_response(Headers, Body, #state{close_after = CloseAfter}) ->
-    {CL0, TE, HasConn} = scan_response_headers(Headers),
+prepare_response(Headers, Body, CloseAfter) ->
+    {CL0, TE, HasConn, Close} = scan_response_headers(Headers),
     {Headers1, CL} = case {CL0, TE, Body} of
         {undefined, undefined, B} when B =/= no_body ->
             CLBin = integer_to_binary(iolist_size(B)),
@@ -1482,21 +1583,28 @@ prepare_response(Headers, Body, #state{close_after = CloseAfter}) ->
                 false   -> {content_length, 0}
             end
     end,
-    {Framing, augment(Framing, TE, HasConn, CloseAfter, Headers1)}.
+    {Framing, augment(Framing, TE, HasConn, CloseAfter, Headers1), Close}.
 
 %% First occurrence of each framing-relevant header (case-insensitive,
-%% matching lookup_ci/2), collected in one traversal.
+%% matching lookup_ci/2), collected in one traversal, plus whether any
+%% `Connection' header carries the `close' token.
 scan_response_headers(Headers) ->
-    scan_response_headers(Headers, undefined, undefined, false).
+    scan_response_headers(Headers, undefined, undefined, false, false).
 
-scan_response_headers([], CL, TE, HasConn) ->
-    {CL, TE, HasConn};
-scan_response_headers([{N, V} | Rest], CL, TE, HasConn) ->
+scan_response_headers([], CL, TE, HasConn, Close) ->
+    {CL, TE, HasConn, Close};
+scan_response_headers([{N, V} | Rest], CL, TE, HasConn, Close) ->
     case h1_parse_erl:to_lower(N) of
-        <<"content-length">>    -> scan_response_headers(Rest, first(CL, V), TE, HasConn);
-        <<"transfer-encoding">> -> scan_response_headers(Rest, CL, first(TE, V), HasConn);
-        <<"connection">>        -> scan_response_headers(Rest, CL, TE, true);
-        _                       -> scan_response_headers(Rest, CL, TE, HasConn)
+        <<"content-length">> ->
+            scan_response_headers(Rest, first(CL, V), TE, HasConn, Close);
+        <<"transfer-encoding">> ->
+            scan_response_headers(Rest, CL, first(TE, V), HasConn, Close);
+        <<"connection">> ->
+            Close1 = Close orelse
+                has_token(h1_parse_erl:to_lower(iolist_to_binary(V)), <<"close">>),
+            scan_response_headers(Rest, CL, TE, true, Close1);
+        _ ->
+            scan_response_headers(Rest, CL, TE, HasConn, Close)
     end.
 
 first(undefined, V) -> V;
@@ -1589,24 +1697,28 @@ handle_send_trailers(From, StreamId, Trailers, State) ->
             Wire = h1_message:encode_last_chunk(Trailers),
             case sock_send(State, Wire) of
                 ok ->
-                    State1 = put_stream(
-                        Stream#stream{state = half_closed_local}, State),
-                    {keep_state, State1, [{reply, From, ok}]};
+                    end_server_stream(From, StreamId, Stream, State);
                 {error, R} ->
                     {keep_state_and_data, [{reply, From, {error, R}}]}
             end;
         {ok, #stream{resp_framing = no_body} = Stream} ->
             %% A bodyless response has no trailer section (RFC 9112 §6.3):
-            %% drop the trailers and end the stream as send_data/4 would.
-            State1 = put_stream(Stream#stream{state = half_closed_local}, State),
-            State2 = maybe_close_server_stream(StreamId, State1),
-            finish_server_send(From, StreamId, [], State2);
+            %% drop the trailers and end the stream.
+            end_server_stream(From, StreamId, Stream, State);
         {ok, _} ->
             {keep_state_and_data,
              [{reply, From, {error, trailers_require_chunked}}]};
         error ->
             {keep_state_and_data, [{reply, From, {error, unknown_stream}}]}
     end.
+
+%% The trailer section ends the response: finish the stream as a final
+%% send_data/4 does, so it is dropped once both sides are done and a pending
+%% close or early-response drain runs.
+end_server_stream(From, StreamId, Stream, State) ->
+    State1 = put_stream(Stream#stream{state = half_closed_local}, State),
+    State2 = maybe_close_server_stream(StreamId, State1),
+    finish_server_send(From, StreamId, [], State2).
 
 %% Interim (1xx) response ahead of the final one. 101 is carved out for
 %% the Upgrade machinery, and HTTP/1.0 clients must not see 1xx at all

@@ -189,9 +189,9 @@ s204_send_response_then_empty_data(Config) ->
 s204_send_response_pipelined(Config) ->
     Sock = connect(Config),
     ok = gen_tcp:send(Sock, [req(<<"GET">>, <<"/204">>, []),
-                             req(<<"GET">>, <<"/next">>, [])]),
-    Expected = <<"HTTP/1.1 204 No Content\r\nx-a: 1\r\n\r\n", ?NEXT/binary>>,
-    ?assertEqual(Expected, recv_exact(Sock, byte_size(Expected))),
+                             req(<<"GET">>, <<"/next">>, close)]),
+    ?assertEqual(<<"HTTP/1.1 204 No Content\r\nx-a: 1\r\n\r\n",
+                   ?NEXT_CLOSE/binary>>, recv_all(Sock)),
     ?assertEqual([ok, ok], results(<<"/204">>)),
     ?assertEqual([ok], results(<<"/next">>)).
 
