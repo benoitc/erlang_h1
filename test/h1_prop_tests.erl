@@ -182,23 +182,24 @@ bodyless_send(Conn, Id, Status, Hs, stream_trailers, Chunks) ->
      | [h1:send_data(Conn, Id, C, false) || Status >= 200, C <- Chunks]]
     ++ [h1:send_trailers(Conn, Id, [{<<"x-t">>, <<"1">>}]) || Status >= 200].
 
-%% The second request goes out once the handler has finished every send for
-%% the first, so all of the first response is already on the wire.
+%% Both requests go out in one write: the second, asking to close, must be
+%% answered right after the first response.
 bodyless_exchange(Port, {Method, _, _, _, _} = Case) ->
     Enc = base64:encode(term_to_binary({self(), Case}),
                         #{mode => urlsafe, padding => false}),
     {ok, S} = gen_tcp:connect("127.0.0.1", Port, [binary, {active, false}]),
     try
         ok = gen_tcp:send(S, [Method, " /case/", Enc,
-                              " HTTP/1.1\r\nhost: x\r\n\r\n"]),
+                              " HTTP/1.1\r\nhost: x\r\n\r\n"
+                              "GET /next HTTP/1.1\r\nhost: x\r\n"
+                              "connection: close\r\n\r\n"]),
+        Bin = bodyless_recv_all(S, <<>>),
         receive
             {bodyless_sent, Results} ->
                 true = lists:all(fun(R) -> R =:= ok end, Results)
         after 5000 -> error(handler_timeout)
         end,
-        ok = gen_tcp:send(S, "GET /next HTTP/1.1\r\nhost: x\r\n"
-                             "connection: close\r\n\r\n"),
-        bodyless_recv_all(S, <<>>)
+        Bin
     after
         gen_tcp:close(S)
     end.

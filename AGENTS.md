@@ -150,6 +150,7 @@ must not lose bytes or close events queued in the mailbox.
   `h1_listener_owner_SUITE` (a server outlives the process that started it),
   `h1_peercert_SUITE` (TLS peer certificate),
   `h1_bodyless_SUITE` (HEAD / 1xx / 204 / 304 framing on both sides),
+  `h1_close_SUITE` (pipelined and handler `Connection: close`, trailers),
   `h1_connect_SUITE`, `h1_upgrade_SUITE`, `h1_serve_socket_SUITE`,
   `h1_ranch_SUITE` (with `h1_ranch_protocol`), `h1_interop_SUITE`
 - Regression tests for wire bugs drive a raw `gen_tcp` peer and assert exact
