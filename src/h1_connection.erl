@@ -97,7 +97,11 @@
     %% Client synchronous upgrade bookkeeping.
     upgrade_from          :: undefined | gen_statem:from(),
     upgrade_protocol      :: undefined | binary(),
-    closed_reason         :: undefined | reason()
+    closed_reason         :: undefined | reason(),
+    %% Client: receive flow control for this response (`manual' waits for
+    %% consume/3), and the monitor on its handler while it is `manual'.
+    flow_control = auto   :: auto | manual,
+    handler_mon           :: undefined | reference()
 }).
 
 -record(state, {
@@ -241,7 +245,16 @@ send_trailers(Pid, StreamId, Trailers) ->
 %% returning `ok' in `auto' mode; `{error, unknown_stream}' once the body of
 %% `StreamId' has ended or it is not the request being read.
 consume(Pid, StreamId, Bytes) when is_integer(Bytes), Bytes >= 0 ->
-    gen_statem:call(Pid, {consume, StreamId, Bytes}).
+    %% A consumer still reading queued chunks after the connection ended
+    %% (the peer closed, a close-delimited body finished) is normal: the
+    %% stream is over, so say so rather than exit the caller.
+    try gen_statem:call(Pid, {consume, StreamId, Bytes})
+    catch exit:{Reason, _} when Reason =:= noproc; Reason =:= normal;
+                                Reason =:= shutdown ->
+              {error, unknown_stream};
+          exit:{{shutdown, _}, _} ->
+              {error, unknown_stream}
+    end.
 
 %% @doc Server: stop applying the receive window to the request body of
 %% `StreamId', for example because its handler is gone. Reading resumes if
@@ -482,6 +495,10 @@ handle_event({call, From}, wait_connected, _OtherState,
 %% Handled in every state, ahead of the lingering-close catch-all: once the
 %% connection drains, the body is finished and consume/3 says so.
 
+handle_event({call, From}, {consume, StreamId, Bytes}, _S,
+             #state{mode = client} = State) ->
+    {Reply, State1} = client_consume(StreamId, Bytes, State),
+    {keep_state, State1, [{reply, From, Reply}]};
 handle_event({call, From}, {consume, _StreamId, _Bytes}, _S,
              #state{flow_control = auto}) ->
     {keep_state_and_data, [{reply, From, ok}]};
@@ -562,6 +579,11 @@ handle_event({timeout, request}, request, _S, State) ->
 handle_event(info, {'DOWN', Ref, process, _Pid, _Reason}, _S,
              #state{owner_ref = Ref} = State) ->
     {stop, {shutdown, owner_down}, State};
+handle_event(info, {'DOWN', Ref, process, _Pid, _Reason}, _S,
+             #state{mode = client} = State) ->
+    %% The handler of a `manual' response is gone: nobody will consume, so
+    %% release the window instead of leaving the socket paused.
+    {keep_state, handler_down(Ref, State)};
 
 %% --- client: send_request ---------------------------------------------------
 
@@ -623,7 +645,8 @@ handle_event({call, From}, {set_stream_handler, StreamId, Handler, Opts},
             Flushed = flush_handler(Stream, Handler),
             NewStream = Stream#stream{handler = Handler, handler_opts = Opts,
                                       recv_buffer = []},
-            State1 = put_stream(NewStream, State),
+            State1 = client_stream_flow(NewStream, Opts,
+                                        put_stream(NewStream, State)),
             {keep_state, State1, [{reply, From, {ok, Flushed}}]};
         error ->
             {keep_state_and_data, [{reply, From, {error, unknown_stream}}]}
@@ -631,7 +654,8 @@ handle_event({call, From}, {set_stream_handler, StreamId, Handler, Opts},
 handle_event({call, From}, {unset_stream_handler, StreamId}, _S, State) ->
     case maps:find(StreamId, State#state.streams) of
         {ok, Stream} ->
-            State1 = put_stream(Stream#stream{handler = undefined}, State),
+            State1 = put_stream(demonitor_handler(Stream#stream{handler = undefined}),
+                                State),
             {keep_state, State1, [{reply, From, ok}]};
         error ->
             {keep_state_and_data, [{reply, From, {error, unknown_stream}}]}
@@ -731,7 +755,7 @@ rearm(St) ->
         false -> set_active_once(St#state{recv_paused = false})
     end.
 
-window_full(#state{mode = server, recv_flow = manual, reading = parse,
+window_full(#state{recv_flow = manual, reading = parse,
                    current_stream = Id, recv_unconsumed = U, recv_window = W})
   when Id =/= undefined, U >= W ->
     true;
@@ -759,6 +783,19 @@ window_stream(_StreamId, _St) ->
 
 %% Stop counting the body of `StreamId' (its handler is gone or the stream
 %% was cancelled) and resume reading if the window had paused it.
+release_window_of(StreamId, #state{mode = client} = St) ->
+    case maps:find(StreamId, St#state.streams) of
+        {ok, #stream{flow_control = manual} = S} ->
+            St1 = put_stream(demonitor_handler(S#stream{flow_control = auto}), St),
+            case St1#state.current_stream of
+                StreamId ->
+                    maybe_resume(St1#state{recv_flow = auto, recv_unconsumed = 0});
+                _ ->
+                    St1
+            end;
+        _ ->
+            St
+    end;
 release_window_of(StreamId, #state{recv_flow = manual} = St) ->
     case window_stream(StreamId, St) of
         true  -> maybe_resume(St#state{recv_flow = auto, recv_unconsumed = 0});
@@ -766,6 +803,65 @@ release_window_of(StreamId, #state{recv_flow = manual} = St) ->
     end;
 release_window_of(_StreamId, St) ->
     St.
+
+%% Client: consume/3 on a response. Credit applies to the response being
+%% read; a `manual' stream still waiting for its response and any `auto'
+%% stream take it as a no-op. A finished or unknown stream is reported.
+client_consume(StreamId, Bytes, #state{current_stream = Cur,
+                                       recv_flow = Flow} = St) ->
+    case maps:find(StreamId, St#state.streams) of
+        {ok, #stream{recv_ended = false}}
+          when StreamId =:= Cur, Flow =:= manual ->
+            U = max(0, St#state.recv_unconsumed - Bytes),
+            {ok, maybe_resume(St#state{recv_unconsumed = U})};
+        {ok, #stream{recv_ended = false}} ->
+            {ok, St};
+        _ ->
+            {{error, unknown_stream}, St}
+    end.
+
+stream_flow(manual) -> manual;
+stream_flow(_) -> auto.
+
+%% Client: `flow_control' in set_stream_handler/4 opts switches the stream's
+%% mode, as in h2. A `manual' stream's handler is monitored so its exit
+%% releases the window. Server streams follow the connection's mode.
+client_stream_flow(#stream{id = Id} = Stream0, Opts, #state{mode = client} = St) ->
+    Flow = stream_flow(maps:get(flow_control, Opts, Stream0#stream.flow_control)),
+    Stream1 = demonitor_handler(Stream0#stream{flow_control = Flow}),
+    Stream = case {Flow, Stream1#stream.handler} of
+        {manual, Pid} when is_pid(Pid) ->
+            Stream1#stream{handler_mon = erlang:monitor(process, Pid)};
+        _ ->
+            Stream1
+    end,
+    St1 = put_stream(Stream, St),
+    case St1#state.current_stream of
+        Id when Flow =:= auto ->
+            maybe_resume(St1#state{recv_flow = auto, recv_unconsumed = 0});
+        Id when St1#state.recv_flow =:= auto ->
+            %% Switched to manual mid-body: count from here.
+            St1#state{recv_flow = manual, recv_unconsumed = 0};
+        _ ->
+            St1
+    end;
+client_stream_flow(_Stream, _Opts, St) ->
+    St.
+
+demonitor_handler(#stream{handler_mon = undefined} = S) ->
+    S;
+demonitor_handler(#stream{handler_mon = Ref} = S) ->
+    _ = erlang:demonitor(Ref, [flush]),
+    S#stream{handler_mon = undefined}.
+
+handler_down(Ref, #state{streams = Streams} = St) ->
+    case [Id || {Id, #stream{handler_mon = R}} <- maps:to_list(Streams), R =:= Ref] of
+        [Id] ->
+            S = maps:get(Id, Streams),
+            release_window_of(Id, put_stream(S#stream{handler_mon = undefined}, St));
+        [] ->
+            St
+    end.
 
 set_active_false(St) ->
     _ = set_passive(St),
@@ -987,7 +1083,10 @@ on_response(Version, Status, P, State) ->
     end,
     State#state{parser = P,
                 current_stream = Id,
-                streams = maps:put(Id, Stream, State#state.streams)}.
+                streams = maps:put(Id, Stream, State#state.streams),
+                recv_flow = Stream#stream.flow_control,
+                recv_unconsumed = 0,
+                recv_paused = false}.
 
 accumulate_trailer({Name, Value}, #state{current_stream = Id} = State)
     when Id =/= undefined ->
@@ -1165,8 +1264,7 @@ deliver_data(_Chunk, _EndStream, State) ->
 
 %% Body payload handed to the handler and not yet consumed. The parser yields
 %% decoded payload, so chunked framing and trailers are never counted.
-count_recv(Chunk, #state{mode = server, recv_flow = manual,
-                         recv_unconsumed = U} = State) ->
+count_recv(Chunk, #state{recv_flow = manual, recv_unconsumed = U} = State) ->
     State#state{recv_unconsumed = U + byte_size(Chunk)};
 count_recv(_Chunk, State) ->
     State.
@@ -1216,7 +1314,9 @@ after_message_done(Rest, #state{mode = server, current_stream = Id} = State) ->
     end;
 after_message_done(Rest, #state{mode = client, current_stream = Id} = State) ->
     State1 = finalize_response(Id, State),
-    State2 = State1#state{parser = reset_parser(State1), current_stream = undefined},
+    State2 = State1#state{parser = reset_parser(State1), current_stream = undefined,
+                          recv_flow = auto, recv_unconsumed = 0,
+                          recv_paused = false},
     case byte_size(Rest) > 0 of
         true -> drive_parser(h1_parse_erl:execute(State2#state.parser, Rest), State2, client);
         false -> {ok, State2}
@@ -1257,6 +1357,11 @@ finalize_response(Id, State) ->
         {ok, Stream} ->
             emit_to_owner_or_handler(Stream, {data, Id, <<>>, true}, State0);
         error -> State0
+    end,
+    %% The response is done: its handler no longer holds a window.
+    _ = case maps:find(Id, State1#state.streams) of
+        {ok, Done} -> demonitor_handler(Done);
+        error -> ok
     end,
     State2 = State1#state{
         streams = maps:remove(Id, State1#state.streams),
@@ -1388,9 +1493,11 @@ handle_send_request_ok(From, Method, Path, Headers, Opts, State) ->
         end,
     case sock_send(State, WireFirst) of
         ok ->
+            Flow = stream_flow(maps:get(flow_control, Opts,
+                                        State#state.flow_control)),
             Stream = #stream{id = Id, state = open, method = Method,
                              path = Path, req_headers = Headers1,
-                             pending_body = Pending},
+                             pending_body = Pending, flow_control = Flow},
             State1 = State#state{
                 next_stream_id = Id + 1,
                 streams = maps:put(Id, Stream, State#state.streams),

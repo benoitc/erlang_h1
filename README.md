@@ -360,6 +360,47 @@ Notes:
   (with Ranch, for example), call `consume/3` yourself, or the socket stays
   paused until a timeout.
 
+### Reading a response slowly on the client
+
+The client takes the same option per request, as `h2:request/3` and
+`quic_h3:request/3` do. With `flow_control => manual` it stops reading the
+socket once `recv_window` bytes of that response's body (default 64 KiB) wait
+unconsumed, so a slow reader holds the server back:
+
+```erlang
+{ok, Conn} = h1:connect("example.com", 80, #{recv_window => 256 * 1024}),
+{ok, Id} = h1:request(Conn, [{<<":method">>, <<"GET">>},
+                             {<<":path">>, <<"/big">>},
+                             {<<"host">>, <<"example.com">>}],
+                      #{flow_control => manual}),
+read_response(Conn, Id).
+
+read_response(Conn, Id) ->
+    receive
+        {h1, Conn, {response, Id, _Status, _Headers}} ->
+            read_response(Conn, Id);
+        {h1, Conn, {data, Id, Bin, Fin}} ->
+            ok = store(Bin),
+            _ = h1:consume(Conn, Id, byte_size(Bin)),
+            case Fin of
+                true  -> ok;
+                false -> read_response(Conn, Id)
+            end
+    end.
+```
+
+Notes:
+
+- Pass `flow_control => manual` to `h1:connect/3` to make it the default for
+  every request on the connection; a request can still ask for `auto`.
+- `h1:set_stream_handler/4` accepts `flow_control` too. If the handler of a
+  `manual` response exits, the window is released and the rest of the body is
+  read and dropped.
+- `consume/3` returns `ok` for an `auto` request, and `{error, unknown_stream}`
+  once the response body has ended or the connection is gone.
+- While a response is paused, the next pipelined response is not read, and
+  `request_timeout` and `idle_timeout` keep running.
+
 ### Chunked response
 
 When the body length isn't known up front, declare `Transfer-Encoding: chunked` and stream with `send_data/4`:
@@ -605,7 +646,9 @@ On a client connection it returns the server's certificate.
   max_keepalive_requests => pos_integer(),             %% default: 100
   idle_timeout           => timeout() | infinity,      %% default: 300_000 (5 min)
   request_timeout        => timeout() | infinity,      %% default: 60_000
-  max_body_size          => pos_integer() | infinity}. %% default: 8_388_608 (8 MB)
+  max_body_size          => pos_integer() | infinity,  %% default: 8_388_608 (8 MB)
+  flow_control           => auto | manual,             %% default for requests: auto
+  recv_window            => pos_integer()}.            %% default: 65_536, manual only
 
 %% h1:start_server/2,3 opts
 #{transport              => tcp | ssl,                 %% default: tcp

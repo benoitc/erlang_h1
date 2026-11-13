@@ -17,6 +17,12 @@ follow [Semantic Versioning](https://semver.org/).
   holds the client back. Responding early, a handler that exits, and the
   request timeouts still end a paused request. The default, `auto`, behaves
   as before.
+- The client gets the same control over response bodies. A request sent with
+  `flow_control => manual` (or every request, when the connection is opened
+  with it) stops reading once `recv_window` bytes of the response wait
+  unread, so a client that reads slowly now holds the server back instead of
+  buffering the whole response. A stream handler that exits releases the
+  window.
 
 ## [0.10.1] - 2026-11-11
 
