@@ -4,6 +4,20 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- A server handler that read its request body slowly could not slow the
+  client down: the server read the socket as fast as the client sent and
+  queued the whole body in memory. Start the server with
+  `flow_control => manual` and the server stops reading once `recv_window`
+  bytes (64 KiB by default) wait unread, then resumes as the handler gives
+  them back with the new `h1:consume/3`, as with h2 and quic_h3. TCP then
+  holds the client back. Responding early, a handler that exits, and the
+  request timeouts still end a paused request. The default, `auto`, behaves
+  as before.
+
 ## [0.10.1] - 2026-11-11
 
 ### Fixed

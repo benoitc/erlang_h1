@@ -47,6 +47,7 @@
 
 %% Common API
 -export([send_data/3, send_data/4]).
+-export([consume/3]).
 -export([send_trailers/3]).
 -export([cancel/2, cancel/3]).
 -export([cancel_stream/2, cancel_stream/3]).
@@ -108,7 +109,9 @@
     max_header_value_size => pos_integer(),
     max_headers => pos_integer(),
     max_header_block_size => pos_integer(),
-    max_body_size => pos_integer() | infinity
+    max_body_size => pos_integer() | infinity,
+    flow_control => auto | manual,
+    recv_window => pos_integer()
 }.
 
 %% Early-response inbound drain budget (lingering close). `{MaxBytes, MaxMs}'
@@ -333,7 +336,7 @@ conn_opts(Opts) ->
                max_line_length, max_request_line_size, max_empty_lines,
                max_header_name_size, max_header_value_size,
                max_headers, max_header_block_size,
-               max_body_size], Opts).
+               max_body_size, flow_control, recv_window], Opts).
 
 %% @doc Serve an already-accepted connection: run the server loop on a
 %% socket someone else accepted. The caller has completed the TCP accept
@@ -489,6 +492,21 @@ send_data(Conn, StreamId, Data, EndStream) ->
 %% pending close or early-response drain runs after the trailers.
 send_trailers(Conn, StreamId, Trailers) ->
     h1_connection:send_trailers(Conn, StreamId, Trailers).
+
+-spec consume(connection(), stream_id(), non_neg_integer()) ->
+    ok | {error, unknown_stream}.
+%% @doc Server: give back `Bytes' of request body credit, as with
+%% `h2:consume/3' and `quic_h3:consume/3'. Only matters on a connection
+%% started with `flow_control => manual': the server stops reading the socket
+%% once `recv_window' body bytes were delivered and not consumed, and resumes
+%% when consume/3 brings the count back under the window. Count the body
+%% bytes your handler received (the `Data' of each `{data, Data, Fin}'),
+%% never framing or trailers.
+%%
+%% Returns `ok' on an `auto' connection without doing anything, and
+%% `{error, unknown_stream}' once the body of `StreamId' has ended.
+consume(Conn, StreamId, Bytes) ->
+    h1_connection:consume(Conn, StreamId, Bytes).
 
 -spec cancel(connection(), stream_id()) -> ok | {error, term()}.
 cancel(Conn, StreamId) ->

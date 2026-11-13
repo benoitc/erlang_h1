@@ -147,6 +147,10 @@ pump(Conn, Handler, Pid, MRef, StreamId) ->
             Pid ! {h1_stream, StreamId, {stream_reset, R}},
             pump(Conn, Handler, Pid, MRef, StreamId);
         {'DOWN', MRef, process, Pid, _Reason} ->
+            %% A handler gone before its body was consumed must not leave
+            %% the socket paused (`flow_control => manual'): release the
+            %% window so the rest of the body is read and dropped as usual.
+            ok = h1_connection:release_window(Conn, StreamId),
             connection_loop(Conn, Handler);
         {h1, Conn, {closed, Reason}} ->
             %% Connection gone mid-stream: unblock the handler (which may be
