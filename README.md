@@ -311,6 +311,55 @@ h1:respond(Conn, Id, 413, Headers, Body,
 The legacy `lingering_timeout => Ms` option still works and maps to
 `{infinity, Ms}`.
 
+### Slowing down the client with flow control
+
+By default the server reads the request body as fast as the client sends it and
+queues every chunk for your handler, whether it reads them or not. Start the
+server with `flow_control => manual` when a handler that reads slowly should
+hold the client back, the way `h2` and `quic_h3` do with the same option.
+
+The server then stops reading the socket once `recv_window` body bytes (default
+64 KiB) were delivered to the handler and not given back. TCP buffers fill and
+the client's sends block. Give the bytes back with `h1:consume/3` as you process
+them:
+
+```erlang
+h1:start_server(8080, #{handler => fun upload/5,
+                        flow_control => manual,
+                        recv_window => 256 * 1024}).
+
+upload(Conn, Id, _Method, _Path, _Headers) ->
+    read_body(Conn, Id).
+
+read_body(Conn, Id) ->
+    receive
+        {h1_stream, Id, {data, Bin, Fin}} ->
+            ok = store(Bin),
+            _ = h1:consume(Conn, Id, byte_size(Bin)),
+            case Fin of
+                true  -> h1:respond(Conn, Id, 201, [], <<>>);
+                false -> read_body(Conn, Id)
+            end
+    end.
+```
+
+Notes:
+
+- Count the body bytes you received, never framing or trailers.
+- `consume/3` returns `{error, unknown_stream}` once the body has ended (as on
+  the last chunk above), and `ok` without doing anything on an `auto` server.
+- The window covers one request at a time and resets when its body ends. While
+  the server is paused, the next pipelined request is not read.
+- A paused request is still bounded by `request_timeout` and `idle_timeout`:
+  neither is reset while the handler holds the body, so a handler that stops
+  consuming for longer loses the connection.
+- Responding early (a `413`) drains the rest of the body as usual; the window
+  never stalls the drain. A handler that exits before reading its body releases
+  the window, and the rest is read and dropped.
+- If you drive `h1_connection` from your own process instead of `h1_server`
+  (with Ranch, for example), call `consume/3` yourself, or the socket stays
+  paused until a timeout.
+
 ### Chunked response
 
 When the body length isn't known up front, declare `Transfer-Encoding: chunked` and stream with `send_data/4`:
@@ -579,7 +628,9 @@ On a client connection it returns the server's certificate.
   max_header_value_size  => pos_integer(),
   max_headers            => pos_integer(),
   max_header_block_size  => pos_integer(),
-  max_body_size          => pos_integer() | infinity}.
+  max_body_size          => pos_integer() | infinity,
+  flow_control           => auto | manual,             %% default: auto
+  recv_window            => pos_integer()}.            %% default: 65_536, manual only
 ```
 
 Every option below `handshake_timeout` is per-connection and is also accepted
@@ -596,6 +647,9 @@ component may be `infinity`, or `0` to disable the drain. The legacy
 `idle_timeout` re-arms on every byte over the connection; it only fires when the peer stops talking entirely. `request_timeout` is armed while a request is in flight (from send-request on the client / from header receipt on the server) and cleared when the response completes. Either firing stops the connection with `{shutdown, idle_timeout}` / `{shutdown, request_timeout}`.
 
 Pass `infinity` to disable.
+
+With `flow_control => manual`, a request paused on its receive window gets no
+new bytes, so neither timer is reset while the handler holds it.
 
 ### Body size cap
 

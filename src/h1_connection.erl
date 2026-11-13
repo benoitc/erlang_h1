@@ -34,6 +34,7 @@
 -export([send_data/3, send_data/4]).
 -export([send_trailers/3]).
 -export([continue/2]).
+-export([consume/3, release_window/2]).
 -export([send_informational/4]).
 -export([peername/1, peercert/1]).
 -export([upgrade/3, upgrade/4]).
@@ -163,6 +164,16 @@
     %% accept_connect. While true the socket stays passive so bytes that
     %% belong to the tunnel are not parsed as HTTP.
     upgrade_pending = false :: boolean(),
+    %% Server: receive-side flow control for request bodies. In `manual'
+    %% mode the socket is not re-armed once `recv_unconsumed' body bytes of
+    %% the current request reach `recv_window'; consume/3 gives credit back.
+    %% `recv_flow' is the mode of the request being read (`auto' between
+    %% requests and once the window is released).
+    flow_control = auto    :: auto | manual,
+    recv_window = 65536    :: pos_integer(),
+    recv_flow = auto       :: auto | manual,
+    recv_unconsumed = 0    :: non_neg_integer(),
+    recv_paused = false    :: boolean(),
     %% Parser limits forwarded from opts.
     parser_opts = []       :: [h1_parse_erl:parser_option()]
 }).
@@ -224,6 +235,19 @@ send_data(Pid, StreamId, Data, EndStream) ->
 
 send_trailers(Pid, StreamId, Trailers) ->
     gen_statem:call(Pid, {send_trailers, StreamId, Trailers}).
+
+%% @doc Server: give back `Bytes' of request body credit on a connection
+%% started with `flow_control => manual'. Counts body payload only. A no-op
+%% returning `ok' in `auto' mode; `{error, unknown_stream}' once the body of
+%% `StreamId' has ended or it is not the request being read.
+consume(Pid, StreamId, Bytes) when is_integer(Bytes), Bytes >= 0 ->
+    gen_statem:call(Pid, {consume, StreamId, Bytes}).
+
+%% @doc Server: stop applying the receive window to the request body of
+%% `StreamId', for example because its handler is gone. Reading resumes if
+%% it was paused. Asynchronous; a no-op in `auto' mode.
+release_window(Pid, StreamId) ->
+    gen_statem:cast(Pid, {release_window, StreamId}).
 
 %% @doc Server: emit a 100 Continue informational response.
 continue(Pid, StreamId) ->
@@ -363,11 +387,24 @@ init({Mode, Socket, Owner, Opts}) ->
         idle_timeout = maps:get(idle_timeout, Opts, 300000),
         request_timeout = maps:get(request_timeout, Opts, 60000),
         drain_budget = drain_budget_from_opts(Opts),
+        flow_control = flow_control_from_opts(Opts),
+        recv_window = recv_window_from_opts(Opts),
         pipeline_enabled = maps:get(pipeline, Opts, true),
         max_keepalive_requests = maps:get(max_keepalive_requests, Opts, 100),
         next_stream_id = 1
     },
     {ok, idle, State}.
+
+flow_control_from_opts(Opts) ->
+    case maps:get(flow_control, Opts, auto) of
+        auto -> auto;
+        manual -> manual
+    end.
+
+recv_window_from_opts(Opts) ->
+    case maps:get(recv_window, Opts, 65536) of
+        N when is_integer(N), N > 0 -> N
+    end.
 
 parser_opts_from(client, Opts) -> parser_base_opts(response, Opts);
 parser_opts_from(server, Opts) -> parser_base_opts(request, Opts).
@@ -440,6 +477,30 @@ handle_event({call, From}, wait_connected, _OtherState,
 handle_event({call, From}, wait_connected, _OtherState,
              #state{wait_connected_waiters = W} = State) ->
     {keep_state, State#state{wait_connected_waiters = [From | W]}};
+
+%% --- receive flow control (server) ------------------------------------------
+%% Handled in every state, ahead of the lingering-close catch-all: once the
+%% connection drains, the body is finished and consume/3 says so.
+
+handle_event({call, From}, {consume, _StreamId, _Bytes}, _S,
+             #state{flow_control = auto}) ->
+    {keep_state_and_data, [{reply, From, ok}]};
+handle_event({call, From}, {consume, StreamId, Bytes}, S, State)
+  when S =/= lingering_close ->
+    case window_stream(StreamId, State) of
+        true ->
+            U = max(0, State#state.recv_unconsumed - Bytes),
+            State1 = maybe_resume(State#state{recv_unconsumed = U}),
+            {keep_state, State1, [{reply, From, ok}]};
+        false ->
+            {keep_state_and_data, [{reply, From, {error, unknown_stream}}]}
+    end;
+handle_event({call, From}, {consume, _StreamId, _Bytes}, lingering_close,
+             _State) ->
+    {keep_state_and_data, [{reply, From, {error, unknown_stream}}]};
+handle_event(cast, {release_window, StreamId}, S, State)
+  when S =/= lingering_close ->
+    {keep_state, release_window_of(StreamId, State)};
 
 %% --- lingering close --------------------------------------------------------
 %% After an early response (request body not fully received) we drain and
@@ -589,7 +650,9 @@ handle_event({call, From}, {cancel_stream, StreamId, _Reason}, _S, State) ->
             put_stream(Stream#stream{state = closed, closed_reason = cancel}, State);
         error -> State
     end,
-    {keep_state, State1#state{close_after = true}, [{reply, From, ok}]};
+    %% A cancelled request must not leave the socket paused by its window.
+    State2 = release_window_of(StreamId, State1),
+    {keep_state, State2#state{close_after = true}, [{reply, From, ok}]};
 
 handle_event({call, From}, {controlling_process, NewOwner}, _S, State) ->
     _ = erlang:demonitor(State#state.owner_ref, [flush]),
@@ -653,6 +716,56 @@ set_active_once(#state{socket = S, transport = ssl} = St) ->
         ok -> St;
         {error, _} -> self() ! {ssl_closed, S}, St
     end.
+
+%% Re-arm the socket after parsing, unless the request body being read has
+%% filled the receive window (`flow_control => manual'). The socket is then
+%% left passive, so the kernel buffers fill and TCP holds the client back;
+%% consume/3 or release_window/2 resumes reading. Only the parse path goes
+%% through here: the discard and lingering-close drains re-arm directly, so
+%% the window never stalls them.
+rearm(#state{recv_flow = auto} = St) ->
+    set_active_once(St);
+rearm(St) ->
+    case window_full(St) of
+        true  -> St#state{recv_paused = true};
+        false -> set_active_once(St#state{recv_paused = false})
+    end.
+
+window_full(#state{mode = server, recv_flow = manual, reading = parse,
+                   current_stream = Id, recv_unconsumed = U, recv_window = W})
+  when Id =/= undefined, U >= W ->
+    true;
+window_full(_St) ->
+    false.
+
+%% Resume a paused socket once the window has room again.
+maybe_resume(#state{recv_paused = true} = St) ->
+    case window_full(St) of
+        true  -> St;
+        false -> set_active_once(St#state{recv_paused = false})
+    end;
+maybe_resume(St) ->
+    St.
+
+%% True when `StreamId' is the request whose body is being read.
+window_stream(StreamId, #state{mode = server, current_stream = StreamId,
+                               streams = Streams}) ->
+    case maps:find(StreamId, Streams) of
+        {ok, #stream{recv_ended = false}} -> true;
+        _ -> false
+    end;
+window_stream(_StreamId, _St) ->
+    false.
+
+%% Stop counting the body of `StreamId' (its handler is gone or the stream
+%% was cancelled) and resume reading if the window had paused it.
+release_window_of(StreamId, #state{recv_flow = manual} = St) ->
+    case window_stream(StreamId, St) of
+        true  -> maybe_resume(St#state{recv_flow = auto, recv_unconsumed = 0});
+        false -> St
+    end;
+release_window_of(_StreamId, St) ->
+    St.
 
 set_active_false(St) ->
     _ = set_passive(St),
@@ -729,7 +842,7 @@ handle_socket_data(Data, #state{parser = P, mode = Mode} = State) ->
         {ok, State1} ->
             Actions = idle_timeout_actions(State1)
                       ++ request_timer_actions(State1),
-            {keep_state, set_active_once(State1), Actions};
+            {keep_state, rearm(State1), Actions};
         {upgrade_client, Stream, NewParser, State1} ->
             complete_client_upgrade(Stream, NewParser, State1);
         {error, Reason, State1} ->
@@ -857,7 +970,10 @@ on_request(Method, URI, Version, P, State) ->
     State#state{parser = P,
                 next_stream_id = Id + 1,
                 current_stream = Id,
-                streams = maps:put(Id, Stream, State#state.streams)}.
+                streams = maps:put(Id, Stream, State#state.streams),
+                recv_flow = State#state.flow_control,
+                recv_unconsumed = 0,
+                recv_paused = false}.
 
 on_response(Version, Status, P, State) ->
     Id = case queue:out(State#state.pending) of
@@ -1042,8 +1158,17 @@ peer_asks_close(Headers, Version) ->
 
 deliver_data(Chunk, EndStream, #state{current_stream = Id} = State)
     when Id =/= undefined ->
-    emit_to_owner_or_handler_lookup(Id, {data, Id, Chunk, EndStream}, State);
+    emit_to_owner_or_handler_lookup(Id, {data, Id, Chunk, EndStream},
+                                    count_recv(Chunk, State));
 deliver_data(_Chunk, _EndStream, State) ->
+    State.
+
+%% Body payload handed to the handler and not yet consumed. The parser yields
+%% decoded payload, so chunked framing and trailers are never counted.
+count_recv(Chunk, #state{mode = server, recv_flow = manual,
+                         recv_unconsumed = U} = State) ->
+    State#state{recv_unconsumed = U + byte_size(Chunk)};
+count_recv(_Chunk, State) ->
     State.
 
 emit_to_owner_or_handler_lookup(Id, Event, State) ->
@@ -1075,7 +1200,10 @@ flush_handler(#stream{recv_buffer = Buf} = _Stream, Handler)
 
 after_message_done(Rest, #state{mode = server, current_stream = Id} = State) ->
     State1 = finalize_request(Id, State),
-    State2 = State1#state{parser = reset_parser(State1), current_stream = undefined},
+    %% The body has ended: the window applies to the next request only.
+    State2 = State1#state{parser = reset_parser(State1), current_stream = undefined,
+                          recv_flow = auto, recv_unconsumed = 0,
+                          recv_paused = false},
     if
         Id =:= State2#state.close_stream ->
             %% Last request on this connection: do not process anything
@@ -1311,7 +1439,7 @@ handle_send_response(From, StreamId, Status, Headers, State0) ->
     %% handler declined the Upgrade. Drop the pending flag and resume
     %% reading the connection.
     {State, ResumeActions} = case State0#state.upgrade_pending of
-        true  -> {set_active_once(State0#state{upgrade_pending = false}), []};
+        true  -> {rearm(State0#state{upgrade_pending = false}), []};
         false -> {State0, []}
     end,
     case maps:find(StreamId, State#state.streams) of
@@ -1349,7 +1477,7 @@ handle_respond(From, StreamId, Status, Headers0, _Body, _Opts, State0)
     handle_send_informational(From, StreamId, Status, Headers0, State0);
 handle_respond(From, StreamId, Status, Headers0, Body, Opts, State0) ->
     {State, ResumeActions} = case State0#state.upgrade_pending of
-        true  -> {set_active_once(State0#state{upgrade_pending = false}), []};
+        true  -> {rearm(State0#state{upgrade_pending = false}), []};
         false -> {State0, []}
     end,
     case maps:find(StreamId, State#state.streams) of
@@ -1957,7 +2085,7 @@ closed_event(ssl, Socket)     -> {ssl_closed, Socket}.
 %% leaves goes unnoticed. The write failed, so no tunnel is coming: a pending
 %% upgrade is over too, and any bytes still queued go through the parser.
 handover_failed(From, Reason, State) ->
-    State1 = set_active_once(State#state{upgrade_pending = false}),
+    State1 = rearm(State#state{upgrade_pending = false}),
     {keep_state, State1, [{reply, From, {error, Reason}}]}.
 
 %% ----------------------------------------------------------------------------

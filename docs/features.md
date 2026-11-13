@@ -27,6 +27,7 @@
 `h1_connection` is a single `gen_statem` used in both client and server mode.
 
 - **Idle and request timers (slowloris guard):** `idle_timeout` (default 5 min) re-armed on every byte, and `request_timeout` (default 60 s) armed while a request is in flight. Either timer firing stops the connection with `{shutdown, idle_timeout}` / `{shutdown, request_timeout}`. Pass `infinity` to disable.
+- **Receive flow control (server, `flow_control => manual`):** the connection stops reading the socket once `recv_window` (default 64 KiB) request body bytes were delivered and not given back with `h1:consume/3`, so TCP holds a client back while its handler reads slowly. The count is payload only, covers the request being read, and resets when its body ends. The early-response drain and the discard after the last request are never stalled; a handler that exits releases the window; `request_timeout` and `idle_timeout` keep running while paused. `consume/3` is a no-op on `auto` (the default) and returns `{error, unknown_stream}` once the body has ended. Client-side flow control for response bodies is not supported yet.
 - **Pipelining flag (`pipeline`):** defaults to `true`. When set to `false`, a client's second `h1:request/*` call while a prior response is still in flight returns `{error, pipeline_disabled}` instead of queueing.
 - **Host auto-add (client):** if the caller didn't include a `host:` header, the client adds one from the hostname passed to `h1:connect/*`. HTTP/1.1 requests reaching the server without a `Host` header are answered with 400 and the connection is closed — RFC 9110 §7.2 requires exactly one `Host`.
 - Keep-alive (RFC 9112 §9.3, §9.6): HTTP/1.1 default is reuse. A request carrying `Connection: close` (or an HTTP/1.0 request without `keep-alive`) makes its own response the last one: responses to earlier pipelined requests keep the connection open, and requests sent after it are read and discarded, never processed. A `Connection: close` the handler sets on a response closes the connection after that response. When input past the last request was read, the close is staged (write side shut, the rest drained within the `early_response_drain` budget) so a reset cannot wipe out the last response.
@@ -76,6 +77,7 @@ h1:wait_connected/1,2
 h1:request/2,3,4,5
 h1:send_data/3,4
 h1:send_trailers/3
+h1:consume/3
 h1:cancel/2,3
 h1:cancel_stream/2,3
 h1:set_stream_handler/3,4
@@ -172,5 +174,6 @@ Inside the server, `h1_server` re-routes `{h1, Conn, {data, …}}` / `{trailers,
 - `rebar3 ct --suite=test/h1_connect_SUITE` — 8 end-to-end CONNECT cases (authority-form targets, IPv6, ExtraHeaders round-trip, no-chunked-framing probe, socket ownership after handoff, `{shutdown, connected}` termination, error paths).
 - `rebar3 ct --suite=test/h1_bodyless_SUITE`: raw-socket cases for HEAD / 1xx / 204 / 304 responses on both sides, with the next response on the same connection, plus a PropEr property over status codes, methods, send paths and body shapes.
 - `rebar3 ct --suite=test/h1_close_SUITE`: raw-socket cases for closing: a pipelined request asking to close, a handler answering with `Connection: close`, and responses ended with trailers.
+- `rebar3 ct --suite=test/h1_flow_control_SUITE`: raw-socket cases for `flow_control => manual`: a handler that never reads, consuming content-length and chunked bodies, `consume/3` after the body and on `auto`, an early 413, a handler that exits, pipelining and `request_timeout` while paused.
 - `rebar3 ct --suite=test/h1_interop_SUITE` — curl / python3 / nginx probes, skipped when the binary is absent.
 - `rebar3 dialyzer` — clean.
