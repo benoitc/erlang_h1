@@ -80,7 +80,10 @@
     max_keepalive_requests => pos_integer(),
     max_header_block_size => pos_integer(),
     idle_timeout => timeout(),
-    request_timeout => timeout()
+    request_timeout => timeout(),
+    max_body_size => pos_integer() | infinity,
+    flow_control => auto | manual,
+    recv_window => pos_integer()
 }.
 
 -type server_opts() :: #{
@@ -155,6 +158,11 @@ wait_connected(Conn, Timeout) -> h1_connection:wait_connected(Conn, Timeout).
 request(Conn, Headers) ->
     request(Conn, Headers, #{}).
 
+%% `Opts' may carry `body' and `flow_control => auto | manual'. With
+%% `manual' the client stops reading the socket once `recv_window' bytes of
+%% this response's body were delivered and not given back with consume/3, as
+%% with `h2:request/3' and `quic_h3:request/3'. The default is the
+%% connection's `flow_control' (`auto' unless set in connect/3).
 -spec request(connection(), headers(), map()) ->
     {ok, stream_id()} | {error, term()}.
 request(Conn, Headers, Opts) ->
@@ -495,16 +503,20 @@ send_trailers(Conn, StreamId, Trailers) ->
 
 -spec consume(connection(), stream_id(), non_neg_integer()) ->
     ok | {error, unknown_stream}.
-%% @doc Server: give back `Bytes' of request body credit, as with
-%% `h2:consume/3' and `quic_h3:consume/3'. Only matters on a connection
-%% started with `flow_control => manual': the server stops reading the socket
-%% once `recv_window' body bytes were delivered and not consumed, and resumes
-%% when consume/3 brings the count back under the window. Count the body
-%% bytes your handler received (the `Data' of each `{data, Data, Fin}'),
-%% never framing or trailers.
+%% @doc Give back `Bytes' of body credit, as with `h2:consume/3' and
+%% `quic_h3:consume/3'. Only matters with `flow_control => manual': the
+%% connection stops reading the socket once `recv_window' body bytes were
+%% delivered and not consumed, and resumes when consume/3 brings the count
+%% back under the window. Count the body bytes you received (the `Data' of
+%% each data event), never framing or trailers.
 %%
-%% Returns `ok' on an `auto' connection without doing anything, and
-%% `{error, unknown_stream}' once the body of `StreamId' has ended.
+%% On a server, `manual' is a server option and covers request bodies; on a
+%% client, it is set per request (request/3) or for the connection
+%% (connect/3) and covers response bodies.
+%%
+%% Returns `ok' without doing anything on an `auto' server or an `auto'
+%% client stream, and `{error, unknown_stream}' once the body of `StreamId'
+%% has ended.
 consume(Conn, StreamId, Bytes) ->
     h1_connection:consume(Conn, StreamId, Bytes).
 
@@ -529,6 +541,10 @@ set_stream_handler(Conn, StreamId, Pid) ->
 
 -spec set_stream_handler(connection(), stream_id(), pid(), map()) ->
     ok | {error, term()}.
+%% @doc As set_stream_handler/3. On a client, `#{flow_control => manual}'
+%% makes the handler consume the response body with consume/3; if the
+%% handler exits first, the window is released and the rest of the body is
+%% read and dropped.
 set_stream_handler(Conn, StreamId, Pid, Opts) ->
     h1_connection:set_stream_handler(Conn, StreamId, Pid, Opts).
 
