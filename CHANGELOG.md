@@ -4,6 +4,23 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [0.11.1] - 2026-11-19
+
+### Fixed
+
+- A server treated an `Upgrade` header on an HTTP/1.0 request as an upgrade
+  request, so a handler could switch protocols with a client or an old proxy
+  that has no upgrade mechanism. HTTP/1.0 requests are now handled as plain
+  requests: the `Upgrade` header is ignored and no longer shown to the
+  handler, and `h1:accept_upgrade/3` refuses them. HTTP/1.1 upgrades are
+  unchanged.
+
+### Added
+
+- `h1:request_version/2` tells a handler which HTTP version a request
+  arrived with, so it can, for example, refuse HTTP/1.0 requests on a path
+  that only serves upgrades.
+
 ## [0.11.0] - 2026-11-13
 
 ### Added

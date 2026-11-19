@@ -17,13 +17,14 @@
     upgrade_with_leftover_bytes/1,
     upgrade_with_path_pseudo_header/1,
     upgrade_wire_path_in_request_line/1,
-    accept_upgrade_dedupes_framing_headers/1
+    accept_upgrade_dedupes_framing_headers/1,
+    http_1_0_upgrade_ignored/1
 ]).
 
 all() ->
     [upgrade_handshake, upgrade_capsule_exchange, upgrade_with_leftover_bytes,
      upgrade_with_path_pseudo_header, upgrade_wire_path_in_request_line,
-     accept_upgrade_dedupes_framing_headers].
+     accept_upgrade_dedupes_framing_headers, http_1_0_upgrade_ignored].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(h1),
@@ -233,6 +234,94 @@ accept_upgrade_dedupes_framing_headers(Config0) ->
                  [V || {<<"sec-websocket-accept">>, V} <- Headers]),
     gen_tcp:close(Sock),
     ok.
+
+%% RFC 9110 §7.8: "A server that receives an Upgrade header field in an
+%% HTTP/1.0 request MUST ignore that Upgrade field." HTTP/1.0 has no
+%% Upgrade mechanism, and an HTTP/1.0 intermediary may have forwarded the
+%% field without understanding it. The same request in HTTP/1.1 still
+%% upgrades. The handler can tell the versions apart with
+%% `h1:request_version/2' (the `{request, ...}' event carries only
+%% method, path and headers), which is how a downstream listener such as
+%% masque answers 400 instead of serving the tunnel.
+http_1_0_upgrade_ignored(Config0) ->
+    Test = self(),
+    Handler = fun(Conn, StreamId, _M, _P, Headers) ->
+        Version = h1:request_version(Conn, StreamId),
+        Upgrade = proplists:get_value(<<"upgrade">>, Headers),
+        %% Ask to upgrade whatever the version: the server must refuse
+        %% on HTTP/1.0 even when the handler asks.
+        case h1:accept_upgrade(Conn, StreamId, []) of
+            {ok, Sock, _Buf} ->
+                Test ! {handler, Version, Upgrade, upgraded},
+                receive done -> ok after 3000 -> ok end,
+                gen_tcp:close(Sock);
+            {error, R} ->
+                Test ! {handler, Version, Upgrade, {error, R}},
+                h1:send_response(Conn, StreamId, 200,
+                                 [{<<"content-length">>, <<"5">>}]),
+                h1:send_data(Conn, StreamId, <<"plain">>, true)
+        end
+    end,
+    Config = start_server(Handler, Config0),
+    Port = h1:server_port(?config(server_ref, Config)),
+    Req = fun(Version) ->
+        <<"GET /tunnel HTTP/", Version/binary, "\r\n"
+          "host: localhost\r\n"
+          "connection: Upgrade\r\n"
+          "upgrade: connect-udp\r\n\r\n">>
+    end,
+
+    %% HTTP/1.0: a plain request. The `Upgrade' field is ignored — it is
+    %% dropped from the headers the handler sees, `accept_upgrade/3'
+    %% refuses, and the answer is a 200, not a 101.
+    {ok, Sock10} = gen_tcp:connect("127.0.0.1", Port,
+                                   [binary, {active, false}, {packet, raw}]),
+    ok = gen_tcp:send(Sock10, Req(<<"1.0">>)),
+    ?assertMatch({200, _, <<"plain">>}, recv_http_response(Sock10)),
+    receive
+        {handler, V10, U10, R10} ->
+            ?assertEqual({ok, {1, 0}}, V10),
+            ?assertEqual(undefined, U10),
+            ?assertEqual({error, no_upgrade_header}, R10)
+    after 3000 -> ct:fail(no_handler_10)
+    end,
+    gen_tcp:close(Sock10),
+
+    %% HTTP/1.1: the identical request still upgrades — the handler sees
+    %% the `Upgrade' header, the version is 1.1, and the 101 goes out.
+    {ok, Sock11} = gen_tcp:connect("127.0.0.1", Port,
+                                   [binary, {active, false}, {packet, raw}]),
+    ok = gen_tcp:send(Sock11, Req(<<"1.1">>)),
+    ?assertMatch(<<"HTTP/1.1 101 ", _/binary>>, recv_until_headers(Sock11)),
+    receive
+        {handler, V11, U11, R11} ->
+            ?assertEqual({ok, {1, 1}}, V11),
+            ?assertEqual(<<"connect-udp">>, U11),
+            ?assertEqual(upgraded, R11)
+    after 3000 -> ct:fail(no_handler_11)
+    end,
+    Test ! done,
+    gen_tcp:close(Sock11),
+    ok.
+
+recv_http_response(Sock) ->
+    [Head, Rest] = binary:split(recv_until_headers(Sock), <<"\r\n\r\n">>),
+    [StatusLine | HeaderLines] = binary:split(Head, <<"\r\n">>, [global]),
+    [_Version, StatusBin | _] = binary:split(StatusLine, <<" ">>, [global]),
+    Hdrs = [begin
+                [N, V] = binary:split(L, <<":">>),
+                {string:lowercase(N), string:trim(V)}
+            end || L <- HeaderLines],
+    CL = binary_to_integer(proplists:get_value(<<"content-length">>, Hdrs, <<"0">>)),
+    {binary_to_integer(StatusBin), Hdrs, recv_body(Sock, Rest, CL)}.
+
+recv_body(_Sock, Acc, CL) when byte_size(Acc) >= CL ->
+    binary:part(Acc, 0, CL);
+recv_body(Sock, Acc, CL) ->
+    case gen_tcp:recv(Sock, 0, 5000) of
+        {ok, Data} -> recv_body(Sock, <<Acc/binary, Data/binary>>, CL);
+        {error, R} -> ct:fail({recv_body, R})
+    end.
 
 recv_until_headers(Sock) ->
     recv_until_headers(Sock, <<>>).
