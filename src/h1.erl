@@ -55,6 +55,7 @@
 -export([goaway/1, goaway/2]).
 -export([close/1]).
 -export([get_settings/1, get_peer_settings/1]).
+-export([request_version/2]).
 -export([peername/1, peercert/1]).
 -export([controlling_process/2]).
 
@@ -566,6 +567,17 @@ get_settings(Conn) -> h1_connection:get_settings(Conn).
 
 -spec get_peer_settings(connection()) -> map().
 get_peer_settings(Conn) -> h1_connection:get_peer_settings(Conn).
+
+%% @doc The HTTP version a request arrived with: `{1, 1}' or `{1, 0}'.
+%% A handler calls it with its own `Conn' and `StreamId' when its answer
+%% depends on the version, for example to refuse an HTTP/1.0 request on a
+%% path that only serves upgrades (the server ignores `Upgrade' on
+%% HTTP/1.0, RFC 9110 §7.8). Returns `{error, unknown_stream}' once the
+%% response is complete.
+-spec request_version(connection(), stream_id()) ->
+    {ok, {non_neg_integer(), non_neg_integer()}} | {error, term()}.
+request_version(Conn, StreamId) ->
+    h1_connection:request_version(Conn, StreamId).
 
 %% @doc Address and port of the connected peer. Works in both modes:
 %% the remote client on a server connection, the remote server on a

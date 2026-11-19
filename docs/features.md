@@ -44,10 +44,11 @@
 - `controlling_process/2` transfers ownership; `set_stream_handler/3,4` routes per-stream events to a different pid (body streaming to a worker).
 - `close/1` tolerates any already-exited state (noproc, `{shutdown, peer_closed}`, etc.) so the caller does not need to trap.
 
-### Upgrade / 101 Switching Protocols (RFC 9112 §7.8)
+### Upgrade / 101 Switching Protocols (RFC 9110 §7.8)
 
 - Client: `h1:upgrade/3,4` writes a GET with `Connection: Upgrade` + `Upgrade: <token>`, blocks until either a 101 arrives (returning `{ok, StreamId, Socket, Buffer, Headers}`) or a non-101 response aborts it.
 - Server: parser detects `Upgrade:` + `Connection: upgrade`, emits `{upgrade, StreamId, Proto, Method, Path, Headers}`, then pauses the socket so no bytes past the request are consumed. The handler calls `h1:accept_upgrade/3` to send the 101 and receive `{ok, Socket, Buffer}`.
+- Server: `Upgrade` on an HTTP/1.0 request is ignored (RFC 9110 §7.8). The request is delivered as a plain `{request, ...}` without the `Upgrade` header, and `h1:accept_upgrade/3` returns `{error, no_upgrade_header}`. `h1:request_version/2` tells a handler which version a request arrived with.
 - On either side, after a successful 101 the `gen_statem` stops with `{shutdown, upgraded}` and the socket is `controlling_process`'d to the caller, along with any leftover buffered bytes.
 - `h1_upgrade` provides framing-agnostic capsule send / recv helpers on the handed-back socket for consumers (e.g. `masque` for RFC 9298 CONNECT-UDP).
 
@@ -105,6 +106,7 @@ h1:pipeline/2
 %% Inspection
 h1:get_settings/1
 h1:get_peer_settings/1
+h1:request_version/2
 h1:peername/1
 h1:peercert/1
 ```
@@ -171,7 +173,7 @@ Inside the server, `h1_server` re-routes `{h1, Conn, {data, …}}` / `{trailers,
 - `rebar3 ct --suite=test/h1_capsule_SUITE` — 9 capsule encode/decode cases.
 - `rebar3 ct --suite=test/h1_connection_SUITE` — 13 loopback `gen_statem` cases: GET / POST / chunked / trailers / keep-alive / pipelining / Expect / Upgrade / capsule exchange.
 - `rebar3 ct --suite=test/h1_e2e_SUITE` — 8 cases through the public API over real TCP + TLS.
-- `rebar3 ct --suite=test/h1_upgrade_SUITE` — 3 end-to-end upgrade cases with capsule framing.
+- `rebar3 ct --suite=test/h1_upgrade_SUITE` — 7 end-to-end upgrade cases with capsule framing, including HTTP/1.0 `Upgrade` being ignored.
 - `rebar3 ct --suite=test/h1_connect_SUITE` — 8 end-to-end CONNECT cases (authority-form targets, IPv6, ExtraHeaders round-trip, no-chunked-framing probe, socket ownership after handoff, `{shutdown, connected}` termination, error paths).
 - `rebar3 ct --suite=test/h1_bodyless_SUITE`: raw-socket cases for HEAD / 1xx / 204 / 304 responses on both sides, with the next response on the same connection, plus a PropEr property over status codes, methods, send paths and body shapes.
 - `rebar3 ct --suite=test/h1_close_SUITE`: raw-socket cases for closing: a pipelined request asking to close, a handler answering with `Connection: close`, and responses ended with trailers.

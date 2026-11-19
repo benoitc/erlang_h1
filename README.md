@@ -34,11 +34,11 @@ was already taken on hex.pm). The OTP application and module atom stay
 
 ```erlang
 %% rebar.config — from hex
-{deps, [{erlang_h1, "0.11.0"}]}.
+{deps, [{erlang_h1, "0.11.1"}]}.
 
 %% Or directly from git
 {deps, [
-    {erlang_h1, {git, "https://github.com/benoitc/erlang_h1.git", {tag, "0.11.0"}}}
+    {erlang_h1, {git, "https://github.com/benoitc/erlang_h1.git", {tag, "0.11.1"}}}
 ]}.
 ```
 
@@ -514,6 +514,22 @@ handle(Conn, Id, <<"GET">>, _Path, Headers) ->
                 [{<<"content-length">>, <<"0">>},
                  {<<"upgrade">>, <<"connect-udp">>}]),
             h1:send_data(Conn, Id, <<>>, true)
+    end.
+```
+
+An `Upgrade` field on an HTTP/1.0 request is ignored (RFC 9110 §7.8): the
+request reaches your handler as a plain request, without the `Upgrade`
+header. If your handler only serves upgrades, read the version with
+`h1:request_version/2` to refuse such a request:
+
+```erlang
+handle(Conn, Id, _Method, _Path, _Headers) ->
+    case h1:request_version(Conn, Id) of
+        {ok, {1, 0}} ->
+            h1:send_response(Conn, Id, 400, [{<<"content-length">>, <<"0">>}]),
+            h1:send_data(Conn, Id, <<>>, true);
+        {ok, {1, 1}} ->
+            serve(Conn, Id)
     end.
 ```
 

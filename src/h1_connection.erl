@@ -45,6 +45,7 @@
 -export([set_stream_handler/3, set_stream_handler/4, unset_stream_handler/2]).
 -export([controlling_process/2]).
 -export([get_settings/1, get_peer_settings/1]).
+-export([request_version/2]).
 -export([set_pipeline/2]).
 -export([close/1]).
 -export([transport_of/1]).
@@ -349,6 +350,13 @@ get_settings(Pid) ->
 
 get_peer_settings(Pid) ->
     gen_statem:call(Pid, get_peer_settings).
+
+%% @doc The HTTP version ({1, 0} or {1, 1}) of a request, read from its
+%% request line. Returns `{error, unknown_stream}' once the stream is gone.
+-spec request_version(pid(), stream_id()) ->
+    {ok, version()} | {error, term()}.
+request_version(Pid, StreamId) ->
+    gen_statem:call(Pid, {request_version, StreamId}).
 
 set_pipeline(Pid, Enabled) when is_boolean(Enabled) ->
     gen_statem:call(Pid, {set_pipeline, Enabled}).
@@ -695,6 +703,12 @@ handle_event({call, From}, get_settings, _S, _State) ->
     {keep_state_and_data, [{reply, From, #{}}]};
 handle_event({call, From}, get_peer_settings, _S, _State) ->
     {keep_state_and_data, [{reply, From, #{}}]};
+handle_event({call, From}, {request_version, StreamId}, _S, State) ->
+    Reply = case maps:find(StreamId, State#state.streams) of
+        {ok, #stream{version = V}} -> {ok, V};
+        error -> {error, unknown_stream}
+    end,
+    {keep_state_and_data, [{reply, From, Reply}]};
 handle_event({call, From}, {set_pipeline, Enabled}, _S, State) ->
     {keep_state, State#state{pipeline_enabled = Enabled},
      [{reply, From, ok}]};
@@ -1101,7 +1115,8 @@ accumulate_trailer({Name, Value}, #state{current_stream = Id} = State)
 %% to set up body framing and emits the appropriate event.
 on_headers_complete(#state{mode = server, current_stream = Id} = State, server) ->
     Stream0 = maps:get(Id, State#state.streams),
-    Headers = h1_parse_erl:get(State#state.parser, headers),
+    Headers = ignore_http_1_0_upgrade(
+                Stream0, h1_parse_erl:get(State#state.parser, headers)),
     Stream1 = Stream0#stream{req_headers = Headers},
     %% RFC 9110 §7.2: HTTP/1.1 requests MUST include a Host header.
     case missing_host_on_http_1_1(Stream1, Headers) of
@@ -1142,7 +1157,7 @@ on_headers_complete(#state{mode = client, current_stream = Id} = State, client) 
     end.
 
 on_request_headers_complete(Stream1, Headers, State, Id) ->
-    case detect_upgrade(State#state.parser, Headers) of
+    case detect_upgrade(Stream1, State#state.parser, Headers) of
         {upgrade, Proto} ->
             Stream2 = Stream1#stream{state = half_closed_remote},
             State1 = put_stream(Stream2, State#state{upgrade_pending = true}),
@@ -1184,7 +1199,20 @@ send_400_missing_host(#stream{id = Id} = Stream, State) ->
     State1#state{close_after = true, current_stream = undefined,
                  streams = maps:remove(Id, State1#state.streams)}.
 
-detect_upgrade(Parser, Headers) ->
+%% RFC 9110 §7.8: "A server that receives an Upgrade header field in an
+%% HTTP/1.0 request MUST ignore that Upgrade field." HTTP/1.0 has no
+%% Upgrade mechanism, and an HTTP/1.0 intermediary may have forwarded the
+%% field without understanding it. Such a request is a plain request, and
+%% the field is dropped from the headers the handler sees so that it cannot
+%% act on it (`accept_upgrade/3' then answers `no_upgrade_header').
+ignore_http_1_0_upgrade(#stream{version = ?HTTP_1_0}, Headers) ->
+    [H || {N, _} = H <- Headers, h1_parse_erl:to_lower(N) =/= <<"upgrade">>];
+ignore_http_1_0_upgrade(_Stream, Headers) ->
+    Headers.
+
+detect_upgrade(#stream{version = ?HTTP_1_0}, _Parser, _Headers) ->
+    no_upgrade;
+detect_upgrade(_Stream, Parser, Headers) ->
     Upgrade = h1_parse_erl:get(Parser, upgrade),
     Conn = h1_parse_erl:get(Parser, connection),
     case {Upgrade, has_token(Conn, <<"upgrade">>)} of
