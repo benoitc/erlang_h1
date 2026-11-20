@@ -40,11 +40,13 @@
     client_cancel_pipelined/1,
     client_cancel_finished_stream/1,
     cancel_first_pipelined_stream/1,
+    request_past_close_point_not_run/1,
     cancel_during_upload/1,
     second_response_after_end/1,
     crash_after_partial_response/1,
     crash_before_response/1,
     crash_after_response/1,
+    internal_error_after_partial_response/1,
     client_cancel_two_pipelined/1,
     client_cancel_two_pipelined_reversed/1,
     client_upgrade_while_closing/1
@@ -60,10 +62,11 @@ all() ->
      client_cancel_before_response, client_cancel_mid_response,
      client_cancel_mid_upload, client_cancel_pipelined,
      client_cancel_finished_stream,
-     cancel_first_pipelined_stream, cancel_during_upload,
+     cancel_first_pipelined_stream, request_past_close_point_not_run,
+     cancel_during_upload,
      second_response_after_end,
      crash_after_partial_response, crash_before_response,
-     crash_after_response,
+     crash_after_response, internal_error_after_partial_response,
      client_cancel_two_pipelined, client_cancel_two_pipelined_reversed,
      client_upgrade_while_closing].
 
@@ -143,6 +146,18 @@ route(<<"/hints">>, C, Id) ->
     ok = h1:send_response(C, Id, 103, [{<<"link">>, <<"</a>">>}]),
     ok = h1:send_response(C, Id, 200, [{<<"content-length">>, <<"2">>}]),
     ok = h1:send_data(C, Id, <<"ok">>, true);
+route(<<"/handoff">>, C, Id) ->
+    %% Let the two requests behind this one be read, cancel the next one,
+    %% and return while another process finishes this response.
+    timer:sleep(200),
+    ok = h1:send_response(C, Id, 200, []),
+    ok = h1:send_data(C, Id, <<"one">>, false),
+    ok = h1:cancel(C, Id + 1),
+    spawn(fun() ->
+              timer:sleep(300),
+              h1:send_data(C, Id, <<"two">>, true)
+          end),
+    ok;
 route(<<"/cut">>, C, Id) ->
     %% Let the pipelined request behind this one be read, then cancel this
     %% one: no earlier response is owed, so the connection closes.
@@ -162,6 +177,10 @@ route(<<"/crash-partial">>, C, Id) ->
     ok = h1:send_response(C, Id, 200, []),
     ok = h1:send_data(C, Id, <<"one">>, false),
     error(boom);
+route(<<"/fail-partial">>, C, Id) ->
+    ok = h1:send_response(C, Id, 200, []),
+    ok = h1:send_data(C, Id, <<"one">>, false),
+    tell({fail, [h1:internal_error(C, Id), h1:internal_error(C, Id)]});
 route(<<"/crash">>, _C, _Id) ->
     error(boom);
 route(<<"/crash-done">>, C, Id) ->
@@ -275,6 +294,19 @@ cancel_later_pipelined_stream(Config) ->
     _ = seen(<<"/first">>),
     ?assertEqual(not_seen, not_seen(<<"/second">>)).
 
+%% A cancel makes the response in progress the last one. The request read
+%% after the cancelled one is past that point: it is never answered, so its
+%% handler must not run either, even when the handler before it returned
+%% early and left its response to another process.
+request_past_close_point_not_run(Config) ->
+    Sock = connect(Config),
+    ok = gen_tcp:send(Sock, [req(<<"/handoff">>), req(<<"/second">>),
+                             req(<<"/third">>)]),
+    ?assertEqual({closed, <<?CHUNKED_HEAD "3\r\none\r\n3\r\ntwo\r\n0\r\n\r\n">>},
+                 recv_all(Sock)),
+    ?assertEqual(not_seen, not_seen(<<"/second">>)),
+    ?assertEqual(not_seen, not_seen(<<"/third">>)).
+
 %% The first of two pipelined requests is cancelled: the connection closes,
 %% and the request read behind it is dropped without running its handler.
 %% Input past the cancelled request was read, so the close is staged.
@@ -361,6 +393,15 @@ crash_after_partial_response(Config) ->
     Sock = connect(Config),
     ok = gen_tcp:send(Sock, req(<<"/crash-partial">>)),
     ?assertEqual({closed, <<?CHUNKED_HEAD "3\r\none\r\n">>}, recv_all(Sock)).
+
+%% The same through the public helper a custom server loop calls: the
+%% started response is cut short, and a second call after the connection
+%% closed still returns `ok'.
+internal_error_after_partial_response(Config) ->
+    Sock = connect(Config),
+    ok = gen_tcp:send(Sock, req(<<"/fail-partial">>)),
+    ?assertEqual({closed, <<?CHUNKED_HEAD "3\r\none\r\n">>}, recv_all(Sock)),
+    ?assertEqual([ok, ok], told(fail)).
 
 %% Nothing sent yet: the client gets a 500 and the connection stays.
 crash_before_response(Config) ->

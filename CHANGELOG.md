@@ -6,8 +6,30 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `h1:internal_error/2` answers a request whose handler failed: a 500
+  when no response was started, or a cancel when one was, so the client
+  never sees a half-written response completed with error text. Custom
+  server loops, such as one under Ranch, can now share the fallback h1
+  uses itself.
+- A new page, `docs/closing.md`, explains when and how a connection closes
+  and what each close reports.
+
+### Changed
+
+- A server connection that closes in stages now reports why it closed (for
+  example after an early response, or after the last response) rather than
+  how the drain ended (timeout, budget spent, or the client closing). A
+  cancel already worked this way.
+
 ### Fixed
 
+- After a cancel, a pipelined request read behind the point where the
+  server connection closes could still have its handler run, when the
+  handler before it returned while its response was still being sent. That
+  handler's response was then written into the middle of the earlier one.
+  Handlers now run only for requests that will be answered.
 - A client that cancelled two pipelined requests could still receive the
   response to the first of them after its reset. The connection now closes
   at the earliest cancelled request, whatever the order of the cancels.
