@@ -316,9 +316,10 @@ accept_connect(Pid, StreamId, ExtraHeaders) ->
 accept_connect(Pid, StreamId, ExtraHeaders, Timeout) ->
     gen_statem:call(Pid, {accept_connect, StreamId, ExtraHeaders}, Timeout).
 
-%% @doc Abort a stream. Because H1 has no RST_STREAM equivalent, this
-%% advertises `Connection: close' and closes the socket once the current
-%% exchange is drained.
+%% @doc Abort a stream. HTTP/1.1 has no RST_STREAM equivalent. On a server,
+%% a stream whose response has not ended closes the connection at once and
+%% the process stops with `{shutdown, stream_cancelled}'; see h1:cancel/2.
+%% On a client the stream is marked closed and the socket stays open.
 cancel_stream(Pid, StreamId) ->
     cancel_stream(Pid, StreamId, cancel).
 
@@ -674,6 +675,23 @@ handle_event({call, From}, {unset_stream_handler, StreamId}, _S, State) ->
 handle_event({call, From}, {send_goaway, _Reason}, _S, State) ->
     State1 = State#state{close_after = true, goaway_sent = true},
     {keep_state, State1, [{reply, From, ok}]};
+%% Server: HTTP/1.1 has no stream reset. A stream still in the table has a
+%% response that did not end (or did not start), and the only way to tell
+%% the client it never will is to close the connection: the client then
+%% records the message as incomplete (RFC 9112 §8, §6.3 item 6).
+handle_event({call, From}, {cancel_stream, StreamId, _Reason}, _S,
+             #state{mode = server} = State) ->
+    case maps:find(StreamId, State#state.streams) of
+        {ok, Stream} ->
+            _ = emit_to_owner_or_handler(Stream,
+                {stream_reset, StreamId, cancel}, State),
+            %% A cancelled request must not leave the socket paused by its
+            %% window.
+            server_cancel(From, StreamId, release_window_of(StreamId, State));
+        error ->
+            %% Its response already ended: nothing is unfinished on the wire.
+            {keep_state, State#state{close_after = true}, [{reply, From, ok}]}
+    end;
 handle_event({call, From}, {cancel_stream, StreamId, _Reason}, _S, State) ->
     State1 = case maps:find(StreamId, State#state.streams) of
         {ok, Stream} ->
@@ -682,7 +700,6 @@ handle_event({call, From}, {cancel_stream, StreamId, _Reason}, _S, State) ->
             put_stream(Stream#stream{state = closed, closed_reason = cancel}, State);
         error -> State
     end,
-    %% A cancelled request must not leave the socket paused by its window.
     State2 = release_window_of(StreamId, State1),
     {keep_state, State2#state{close_after = true}, [{reply, From, ok}]};
 
@@ -1578,6 +1595,11 @@ handle_send_response(From, StreamId, Status, Headers, State0) ->
         false -> {State0, []}
     end,
     case maps:find(StreamId, State#state.streams) of
+        {ok, #stream{status = Sent}} when Sent =/= undefined ->
+            %% One final response per request: a second status line would
+            %% be read as body of the first.
+            {keep_state_and_data,
+             [{reply, From, {error, response_already_sent}}]};
         {ok, Stream} ->
             %% If the request body is still incoming, the connection will
             %% close after this response — commit Connection: close now,
@@ -1616,6 +1638,9 @@ handle_respond(From, StreamId, Status, Headers0, Body, Opts, State0) ->
         false -> {State0, []}
     end,
     case maps:find(StreamId, State#state.streams) of
+        {ok, #stream{status = Sent}} when Sent =/= undefined ->
+            {keep_state_and_data,
+             [{reply, From, {error, response_already_sent}}]};
         {ok, Stream} ->
             %% Resolve the drain budget up front so an invalid per-response
             %% `early_response_drain' is rejected before anything is sent.
@@ -1689,6 +1714,27 @@ finish_server_send(From, StreamId, ResumeActions, Budget, State) ->
             end;
         _ ->
             {keep_state, State, Actions}
+    end.
+
+%% Close for a cancelled stream. Closing at once would cut the response to
+%% an earlier pipelined request that is still pending, so in that case the
+%% earliest pending response becomes the last one (RFC 9112 §9.6), the
+%% cancelled stream is dropped so nothing can be sent on it, and later input
+%% is discarded.
+server_cancel(From, StreamId, #state{streams = Streams} = State) ->
+    Reply = {reply, From, ok},
+    case [Id || Id <- maps:keys(Streams), Id < StreamId] of
+        [] ->
+            {stop_and_reply, {shutdown, stream_cancelled}, [Reply], State};
+        Earlier ->
+            State1 = mark_close_stream(lists:min(Earlier), State),
+            Current = case State1#state.current_stream of
+                StreamId -> undefined;
+                Other -> Other
+            end,
+            State2 = State1#state{streams = maps:remove(StreamId, Streams),
+                                  current_stream = Current},
+            {keep_state, State2, [Reply | clear_request_timeout()]}
     end.
 
 %% The handler's own `Connection: close' makes this response the last.

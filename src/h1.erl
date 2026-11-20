@@ -440,6 +440,10 @@ server_port({_, _, Port}) -> Port.
 %% A `Connection: close' you set makes this the last response: h1 closes the
 %% connection once it ends and does not process later requests. The same
 %% holds for respond/5,6.
+%%
+%% A stream takes one final response: a second send_response/4 or
+%% respond/5,6 returns `{error, response_already_sent}' and writes nothing.
+%% Interim (1xx) responses before the final one are not counted.
 send_response(Conn, StreamId, Status, Headers) ->
     h1_connection:send_response(Conn, StreamId, Status, Headers).
 
@@ -522,10 +526,29 @@ consume(Conn, StreamId, Bytes) ->
     h1_connection:consume(Conn, StreamId, Bytes).
 
 -spec cancel(connection(), stream_id()) -> ok | {error, term()}.
+%% @doc Abort a stream. The stream's handler or owner receives
+%% `{stream_reset, StreamId, cancel}'.
+%%
+%% On a server, HTTP/1.1 has no way to reset one response, so cancelling a
+%% stream whose response has not ended closes the connection, whether or
+%% not a response byte went out. The client reads what was already sent,
+%% then end of file, and records the response as incomplete (RFC 9112 §8).
+%% The connection process stops with `{shutdown, stream_cancelled}', so
+%% later send calls on it exit as after any other close. Pipelined requests
+%% behind the cancelled one are dropped with the connection.
+%%
+%% When an earlier pipelined response is still pending, that response is
+%% allowed to end first and is the last one on the connection; sends on the
+%% cancelled stream return `{error, unknown_stream}'.
+%%
+%% Cancelling a stream whose response already ended writes nothing; the
+%% connection closes after the next response.
 cancel(Conn, StreamId) ->
     h1_connection:cancel_stream(Conn, StreamId).
 
 -spec cancel(connection(), stream_id(), term()) -> ok | {error, term()}.
+%% @doc As cancel/2. `Reason' is accepted for parity with `h2' and
+%% `quic_h3' and is not sent to the peer.
 cancel(Conn, StreamId, Reason) ->
     h1_connection:cancel_stream(Conn, StreamId, Reason).
 
