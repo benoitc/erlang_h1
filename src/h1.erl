@@ -551,10 +551,18 @@ consume(Conn, StreamId, Bytes) ->
 %% Cancelling a stream whose response already ended writes nothing; the
 %% connection closes after the next response.
 %%
-%% On a client, cancel does not close anything: the owner receives the
-%% stream reset, the connection stays usable for further requests, and the
-%% response to the cancelled request is still read and delivered when the
-%% server sends it. Call close/1 to stop waiting for it.
+%% On a client, cancelling a request whose response has not ended closes
+%% the connection too: otherwise the server would keep sending the response,
+%% or keep waiting for the rest of the request body. Nothing more of that
+%% response is delivered. The connection stops with `normal', as after
+%% close/1, and the owner receives `{closed, normal}'.
+%%
+%% When earlier pipelined requests are still waiting for their responses,
+%% those are delivered first and the connection closes after them. Until
+%% then send_data/3,4 and send_trailers/3 on the cancelled request return
+%% `{error, cancelled}' and a new request returns `{error, closing}'.
+%% Requests pipelined behind the cancelled one are dropped with the
+%% connection.
 cancel(Conn, StreamId) ->
     h1_connection:cancel_stream(Conn, StreamId).
 

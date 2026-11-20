@@ -153,6 +153,8 @@
     %% Server: the stream whose response is the last on this connection,
     %% set by a request or a response carrying `Connection: close'
     %% (RFC 9112 §9.6). Once its request is read, later input is discarded.
+    %% Client: a cancelled request waiting behind earlier pipelined ones;
+    %% the connection closes when its turn to be answered comes.
     close_stream           :: undefined | stream_id(),
     reading = parse        :: parse | discard,
     %% Server: input past the last request was read or discarded, so the
@@ -319,7 +321,8 @@ accept_connect(Pid, StreamId, ExtraHeaders, Timeout) ->
 %% @doc Abort a stream. HTTP/1.1 has no RST_STREAM equivalent. On a server,
 %% a stream whose response has not ended closes the connection at once and
 %% the process stops with `{shutdown, stream_cancelled}'; see h1:cancel/2.
-%% On a client the stream is marked closed and the socket stays open.
+%% A client closes too, once the responses to earlier pipelined requests
+%% have been read, and stops with `normal' as close/1 does.
 cancel_stream(Pid, StreamId) ->
     cancel_stream(Pid, StreamId, cancel).
 
@@ -692,16 +695,19 @@ handle_event({call, From}, {cancel_stream, StreamId, _Reason}, _S,
             %% Its response already ended: nothing is unfinished on the wire.
             {keep_state, State#state{close_after = true}, [{reply, From, ok}]}
     end;
+%% Client: abandoning a request also means closing, since the server would
+%% otherwise keep sending its response (or keep waiting for the rest of the
+%% request body) on this connection.
 handle_event({call, From}, {cancel_stream, StreamId, _Reason}, _S, State) ->
-    State1 = case maps:find(StreamId, State#state.streams) of
+    case maps:find(StreamId, State#state.streams) of
         {ok, Stream} ->
             _ = emit_to_owner_or_handler(Stream,
                 {stream_reset, StreamId, cancel}, State),
-            put_stream(Stream#stream{state = closed, closed_reason = cancel}, State);
-        error -> State
-    end,
-    State2 = release_window_of(StreamId, State1),
-    {keep_state, State2#state{close_after = true}, [{reply, From, ok}]};
+            client_cancel(From, Stream, release_window_of(StreamId, State));
+        error ->
+            %% Its response already ended: nothing is left to abandon.
+            {keep_state, State#state{close_after = true}, [{reply, From, ok}]}
+    end;
 
 handle_event({call, From}, {controlling_process, NewOwner}, _S, State) ->
     _ = erlang:demonitor(State#state.owner_ref, [flush]),
@@ -967,9 +973,16 @@ handle_socket_data(Data, #state{parser = P, mode = Mode} = State) ->
             Actions = idle_timeout_actions(State1),
             {keep_state, set_active_false(State1), Actions};
         {ok, State1} ->
-            Actions = idle_timeout_actions(State1)
-                      ++ request_timer_actions(State1),
-            {keep_state, rearm(State1), Actions};
+            case cancel_due(State1) of
+                true ->
+                    %% Every response owed before the cancelled request has
+                    %% been read.
+                    {stop, normal, State1};
+                false ->
+                    Actions = idle_timeout_actions(State1)
+                              ++ request_timer_actions(State1),
+                    {keep_state, rearm(State1), Actions}
+            end;
         {upgrade_client, Stream, NewParser, State1} ->
             complete_client_upgrade(Stream, NewParser, State1);
         {error, Reason, State1} ->
@@ -1362,8 +1375,9 @@ after_message_done(Rest, #state{mode = client, current_stream = Id} = State) ->
     State2 = State1#state{parser = reset_parser(State1), current_stream = undefined,
                           recv_flow = auto, recv_unconsumed = 0,
                           recv_paused = false},
-    case byte_size(Rest) > 0 of
+    case byte_size(Rest) > 0 andalso not cancel_due(State2) of
         true -> drive_parser(h1_parse_erl:execute(State2#state.parser, Rest), State2, client);
+        %% Nothing left, or what is left answers a cancelled request.
         false -> {ok, State2}
     end.
 
@@ -1480,6 +1494,11 @@ continue_after_informational(State, Id) ->
 %% Client: send_request
 %% ----------------------------------------------------------------------------
 
+handle_send_request(From, _Method, _Path, _Headers, _Opts,
+                    #state{close_stream = Cancelled})
+  when Cancelled =/= undefined ->
+    %% Closing for a cancelled request: a new one would never be answered.
+    {keep_state_and_data, [{reply, From, {error, closing}}]};
 handle_send_request(From, Method, Path, Headers, Opts,
                     #state{pipeline_enabled = false, pending = Q} = State) ->
     case queue:is_empty(Q) of
@@ -1737,6 +1756,37 @@ server_cancel(From, StreamId, #state{streams = Streams} = State) ->
             {keep_state, State2, [Reply | clear_request_timeout()]}
     end.
 
+%% Close for a cancelled request. Responses to earlier pipelined requests
+%% are still owed and are read first: the cancelled stream is kept as the
+%% point where the connection closes (`close_stream'), nothing more is sent
+%% on it and no new request is accepted. Its own response is never read.
+%% The stop reason is `normal', as for close/1: the owner asked for it, and
+%% the connection is linked to an owner that may not trap exits.
+client_cancel(From, #stream{id = StreamId} = Stream, State) ->
+    Reply = {reply, From, ok},
+    case cancel_due(State#state{close_stream = StreamId}) of
+        true ->
+            Waiting = case Stream#stream.upgrade_from of
+                undefined -> [];
+                UpFrom -> [{reply, UpFrom, {error, cancelled}}]
+            end,
+            {stop_and_reply, normal, [Reply | Waiting], State};
+        false ->
+            Stream1 = Stream#stream{state = closed, closed_reason = cancel,
+                                    pending_body = undefined},
+            State1 = put_stream(Stream1, State),
+            {keep_state, State1#state{close_stream = StreamId,
+                                      close_after = true}, [Reply]}
+    end.
+
+%% Client: true when the cancelled request is the next one to be answered,
+%% so no earlier response is still owed.
+cancel_due(#state{mode = client, close_stream = Id, pending = Q})
+  when Id =/= undefined ->
+    queue:peek(Q) =:= {value, Id};
+cancel_due(_State) ->
+    false.
+
 %% The handler's own `Connection: close' makes this response the last.
 handler_close(true, StreamId, State) -> mark_close_stream(StreamId, State);
 handler_close(false, _StreamId, State) -> State.
@@ -1948,6 +1998,8 @@ ensure_close(Headers, _HasConn, _CloseAfter) ->
 
 handle_send_data(From, StreamId, Data, EndStream, State) ->
     case maps:find(StreamId, State#state.streams) of
+        {ok, #stream{closed_reason = cancel}} ->
+            {keep_state_and_data, [{reply, From, {error, cancelled}}]};
         {ok, Stream} ->
             case send_body(State, Stream, Data, EndStream) of
                 ok ->
@@ -2002,6 +2054,8 @@ maybe_close_server_stream(_, State) -> State.
 
 handle_send_trailers(From, StreamId, Trailers, State) ->
     case maps:find(StreamId, State#state.streams) of
+        {ok, #stream{closed_reason = cancel}} ->
+            {keep_state_and_data, [{reply, From, {error, cancelled}}]};
         {ok, #stream{resp_framing = chunked} = Stream} ->
             Wire = h1_message:encode_last_chunk(Trailers),
             case sock_send(State, Wire) of
