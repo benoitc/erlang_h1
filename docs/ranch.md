@@ -204,13 +204,21 @@ spawn_handler(Handler, Conn, Id, Method, Path, Headers) ->
         catch Class:Reason:Stack ->
             error_logger:error_msg("h1 handler crash ~p:~p~n~p~n",
                                    [Class, Reason, Stack]),
-            catch h1:send_response(Conn, Id, 500,
-                [{<<"content-length">>, <<"21">>},
-                 {<<"content-type">>, <<"text/plain">>}]),
-            catch h1:send_data(Conn, Id, <<"Internal Server Error">>, true)
+            catch internal_error(Conn, Id)
         end
     end),
     Pid.
+
+%% A response already started cannot be followed by a 500: cancel it so the
+%% client sees it cut short, instead of the error text ending it.
+internal_error(Conn, Id) ->
+    case h1:send_response(Conn, Id, 500,
+                          [{<<"content-length">>, <<"21">>},
+                           {<<"content-type">>, <<"text/plain">>}]) of
+        ok -> h1:send_data(Conn, Id, <<"Internal Server Error">>, true);
+        {error, response_already_sent} -> h1:cancel(Conn, Id);
+        {error, _} -> ok
+    end.
 
 invoke(Fun, Conn, Id, M, P, Hs) when is_function(Fun, 5) ->
     Fun(Conn, Id, M, P, Hs);

@@ -4,6 +4,33 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- A client that cancelled two pipelined requests could still receive the
+  response to the first of them after its reset. The connection now closes
+  at the earliest cancelled request, whatever the order of the cancels.
+- On a server, cancelling a pipelined request that waited behind another
+  one dropped its response but still ran its handler, so the handler's side
+  effects happened anyway. That handler no longer runs.
+- A client could still start an upgrade while closing for a cancelled
+  request, which corrupted the response being read. The upgrade is now
+  refused, as a new request already was.
+- A handler that crashed after starting its response had the error text
+  written into that response, which then ended as if it had succeeded. The
+  response is now cut short, so the client knows it is incomplete. A crash
+  before any response still answers 500.
+- A server cancel while the request body was still arriving closed the
+  connection outright, and the client could lose the response bytes already
+  sent to a connection reset. The connection now stops sending, drains the
+  incoming body within the early response drain budget, then closes. Send
+  calls on the cancelled stream return an error during that drain instead
+  of exiting.
+- The documentation said a second response on a stream is refused with
+  `response_already_sent`. That holds while the first response is in
+  progress; once it has ended the call returns `unknown_stream`.
+
 ## [0.12.0] - 2026-11-20
 
 ### Fixed

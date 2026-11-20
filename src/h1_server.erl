@@ -107,16 +107,12 @@ close(ssl, Sock) -> _ = ssl:close(Sock), ok.
 connection_loop(Conn, Handler) ->
     receive
         {h1, Conn, {request, StreamId, Method, Path, Headers}} ->
-            {Pid, MRef} = start_handler(Conn, StreamId, Method, Path,
-                                        Headers, Handler),
-            pump(Conn, Handler, Pid, MRef, StreamId);
+            dispatch(Conn, StreamId, Method, Path, Headers, Handler);
         {h1, Conn, {upgrade, StreamId, _Proto, Method, Path, Headers}} ->
             %% Hand the upgrade request to the user handler exactly as a
-            %% regular request — it can inspect `Upgrade:' in Headers
+            %% regular request: it can inspect `Upgrade:' in Headers
             %% and call `h1:accept_upgrade/3' to switch protocols.
-            {Pid, MRef} = start_handler(Conn, StreamId, Method, Path,
-                                        Headers, Handler),
-            pump(Conn, Handler, Pid, MRef, StreamId);
+            dispatch(Conn, StreamId, Method, Path, Headers, Handler);
         {h1, Conn, {upgraded, _StreamId, _Proto, _Sock, _Buf}} ->
             ok;
         {h1, Conn, {upgraded, _StreamId, _Proto, _Sock, _Buf, _Hs}} ->
@@ -132,6 +128,22 @@ connection_loop(Conn, Handler) ->
             %% `h1:serve_socket/2'. It is gone, so take the connection with it.
             close_connection(Conn);
         _Other ->
+            connection_loop(Conn, Handler)
+    end.
+
+%% A request is announced as soon as its head is parsed, so a pipelined one
+%% waits here while the handler before it runs. If that handler (or anyone)
+%% cancelled it meanwhile, its handler must not run at all: the check is a
+%% call to the connection, so it is ordered after a cancel made by the
+%% previous handler before it exited. The stream's queued body and reset are
+%% dropped by connection_loop/2.
+dispatch(Conn, StreamId, Method, Path, Headers, Handler) ->
+    case h1_connection:stream_open(Conn, StreamId) of
+        true ->
+            {Pid, MRef} = start_handler(Conn, StreamId, Method, Path,
+                                        Headers, Handler),
+            pump(Conn, Handler, Pid, MRef, StreamId);
+        false ->
             connection_loop(Conn, Handler)
     end.
 
@@ -179,16 +191,27 @@ start_handler(Conn, StreamId, Method, Path, Headers, Handler) ->
             Class:Reason:Stack ->
                 error_logger:error_msg("h1 handler crashed: ~p:~p~n~p~n",
                                        [Class, Reason, Stack]),
-                try
-                    h1_connection:send_response(
-                        Conn, StreamId, 500,
-                        [{<<"content-length">>, <<"21">>},
-                         {<<"content-type">>, <<"text/plain">>}]),
-                    h1_connection:send_data(
-                        Conn, StreamId, <<"Internal Server Error">>, true)
-                catch _:_ -> ok end
+                try internal_error(Conn, StreamId) catch _:_ -> ok end
         end
     end).
+
+%% Answer 500 for a crashed handler. If the handler had already started its
+%% response, a 500 cannot follow it, and writing the error text would only
+%% complete that response as if it had succeeded: cancel it instead, so the
+%% client sees it cut short. A response that already ended is left alone.
+internal_error(Conn, StreamId) ->
+    case h1_connection:send_response(
+           Conn, StreamId, 500,
+           [{<<"content-length">>, <<"21">>},
+            {<<"content-type">>, <<"text/plain">>}]) of
+        ok ->
+            h1_connection:send_data(Conn, StreamId,
+                                    <<"Internal Server Error">>, true);
+        {error, response_already_sent} ->
+            h1_connection:cancel_stream(Conn, StreamId);
+        {error, _} ->
+            ok
+    end.
 
 invoke(Fun, Conn, StreamId, Method, Path, Headers) when is_function(Fun, 5) ->
     Fun(Conn, StreamId, Method, Path, Headers);
