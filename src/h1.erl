@@ -44,6 +44,7 @@
 -endif.
 -export([send_response/4, respond/5, respond/6]).
 -export([send_informational/4]).
+-export([internal_error/2]).
 
 %% Common API
 -export([send_data/3, send_data/4]).
@@ -533,6 +534,32 @@ send_trailers(Conn, StreamId, Trailers) ->
 %% has ended.
 consume(Conn, StreamId, Bytes) ->
     h1_connection:consume(Conn, StreamId, Bytes).
+
+-spec internal_error(connection(), stream_id()) -> ok.
+%% @doc Server: answer a request whose handler failed. Call it from the
+%% `catch' around your handler, as h1's own server loop does.
+%%
+%% If no response was started, the client gets a 500 with the body
+%% `Internal Server Error'. If a response was already started, a 500 cannot
+%% follow it and writing the error text would end that response as if it had
+%% succeeded, so the stream is cancelled instead (see cancel/2): the client
+%% sees the response cut short (RFC 9112 §8). If the response had already
+%% ended, or the connection is gone, nothing happens. Always returns `ok'.
+internal_error(Conn, StreamId) ->
+    try send_response(Conn, StreamId, 500,
+                      [{<<"content-length">>, <<"21">>},
+                       {<<"content-type">>, <<"text/plain">>}]) of
+        ok ->
+            _ = send_data(Conn, StreamId, <<"Internal Server Error">>, true),
+            ok;
+        {error, response_already_sent} ->
+            _ = cancel(Conn, StreamId),
+            ok;
+        {error, _} ->
+            ok
+    catch
+        exit:_ -> ok
+    end.
 
 -spec cancel(connection(), stream_id()) -> ok | {error, term()}.
 %% @doc Abort a stream. The stream's handler or owner receives

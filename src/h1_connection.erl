@@ -145,21 +145,22 @@
     %% Bytes still allowed to be discarded during the current drain
     %% (set from the budget on entering `lingering_close').
     drain_left             :: undefined | non_neg_integer() | infinity,
-    %% Stop reason once a lingering close ends, when it is not the drain's
-    %% own outcome (a cancel keeps `{shutdown, stream_cancelled}').
-    linger_reason          :: undefined | {shutdown, atom()},
+    %% Server: why the connection closes. A staged close (lingering_close)
+    %% stops with it whatever ends the drain. Set by server_close/5.
+    close_reason = normal  :: term(),
     %% Upgrade handoff (synchronous server-side accept).
     upgrade_accept         :: undefined | {pid(), reference(), stream_id()},
     %% Shutdown policy. `close_after': close once the response in progress
     %% is done (goaway, cancel, parse error, early response).
     close_after = false    :: boolean(),
     goaway_sent = false    :: boolean(),
-    %% Server: the stream whose response is the last on this connection,
-    %% set by a request or a response carrying `Connection: close'
-    %% (RFC 9112 §9.6). Once its request is read, later input is discarded.
-    %% Client: a cancelled request waiting behind earlier pipelined ones;
-    %% the connection closes when its turn to be answered comes.
-    close_stream           :: undefined | stream_id(),
+    %% The close point: the first stream this connection will not serve,
+    %% the same on both sides. Streams below it are answered; streams at or
+    %% above it never are, and the connection closes once those below are
+    %% done. It only moves down. Server: a request or response carrying
+    %% `Connection: close' on stream N sets N + 1 (RFC 9112 §9.6), and input
+    %% past N is discarded. Client: cancelling request N sets N.
+    close_at               :: undefined | stream_id(),
     reading = parse        :: parse | discard,
     %% Server: input past the last request was read or discarded, so the
     %% close must be staged (lingering close) to avoid a reset.
@@ -562,18 +563,18 @@ handle_event(info, {ssl, Sock, Data}, lingering_close,
     drain_discard(Data, State);
 handle_event(info, {tcp_closed, Sock}, lingering_close,
              #state{socket = Sock} = State) ->
-    {stop, linger_stop({shutdown, closed}, State), State};
+    {stop, State#state.close_reason, State};
 handle_event(info, {ssl_closed, Sock}, lingering_close,
              #state{socket = Sock} = State) ->
-    {stop, linger_stop({shutdown, closed}, State), State};
+    {stop, State#state.close_reason, State};
 handle_event(info, {tcp_error, Sock, _R}, lingering_close,
              #state{socket = Sock} = State) ->
-    {stop, linger_stop({shutdown, closed}, State), State};
+    {stop, State#state.close_reason, State};
 handle_event(info, {ssl_error, Sock, _R}, lingering_close,
              #state{socket = Sock} = State) ->
-    {stop, linger_stop({shutdown, closed}, State), State};
+    {stop, State#state.close_reason, State};
 handle_event({timeout, linger}, linger, lingering_close, State) ->
-    {stop, linger_stop({shutdown, lingering_timeout}, State), State};
+    {stop, State#state.close_reason, State};
 handle_event({call, From}, _Msg, lingering_close, _State) ->
     %% The stream is finished and the connection is closing.
     {keep_state_and_data, [{reply, From, {error, closed}}]};
@@ -749,8 +750,9 @@ handle_event({call, From}, {request_version, StreamId}, _S, State) ->
     end,
     {keep_state_and_data, [{reply, From, Reply}]};
 handle_event({call, From}, {stream_open, StreamId}, _S, State) ->
-    {keep_state_and_data,
-     [{reply, From, maps:is_key(StreamId, State#state.streams)}]};
+    Open = maps:is_key(StreamId, State#state.streams)
+           andalso served(StreamId, State),
+    {keep_state_and_data, [{reply, From, Open}]};
 handle_event({call, From}, {set_pipeline, Enabled}, _S, State) ->
     {keep_state, State#state{pipeline_enabled = Enabled},
      [{reply, From, ok}]};
@@ -1016,7 +1018,10 @@ answer_parse_error(Reason, #state{mode = server} = State) ->
     case answerable(Reason, State) of
         true ->
             State1 = send_error_response(Reason, State),
-            enter_lingering_close([], State1#state.drain_budget, State1);
+            %% The rest of a malformed request cannot be known, so the
+            %% close is always staged.
+            server_close({shutdown, Reason}, [], State1#state.drain_budget,
+                         true, State1);
         false ->
             {stop, {shutdown, Reason}, State}
     end;
@@ -1308,10 +1313,8 @@ apply_peer_connection_policy(State, Headers, Version) ->
 %% connection open; requests after it are not processed.
 apply_request_close_policy(State, Id, Headers, Version) ->
     case peer_asks_close(Headers, Version) of
-        true when State#state.close_stream =:= undefined ->
-            State#state{keepalive = false, close_stream = Id};
         true ->
-            State#state{keepalive = false};
+            State#state{keepalive = false, close_at = lower_close_at(Id + 1, State)};
         false ->
             State
     end.
@@ -1379,12 +1382,12 @@ after_message_done(Rest, #state{mode = server, current_stream = Id} = State) ->
     State2 = State1#state{parser = reset_parser(State1), current_stream = undefined,
                           recv_flow = auto, recv_unconsumed = 0,
                           recv_paused = false},
-    if
-        Id =:= State2#state.close_stream ->
-            %% Last request on this connection: do not process anything
-            %% after it (RFC 9112 §9.6).
+    case served(Id + 1, State2) of
+        false ->
+            %% The next request is past the close point: do not process
+            %% anything after this one (RFC 9112 §9.6).
             {ok, stop_reading(Rest =/= <<>>, State2)};
-        byte_size(Rest) > 0 ->
+        true when Rest =/= <<>> ->
             drive_parser(h1_parse_erl:execute(State2#state.parser, Rest), State2, server);
         true ->
             {ok, State2}
@@ -1514,8 +1517,8 @@ continue_after_informational(State, Id) ->
 %% ----------------------------------------------------------------------------
 
 handle_send_request(From, _Method, _Path, _Headers, _Opts,
-                    #state{close_stream = Cancelled})
-  when Cancelled =/= undefined ->
+                    #state{close_at = CloseAt})
+  when CloseAt =/= undefined ->
     %% Closing for a cancelled request: a new one would never be answered.
     {keep_state_and_data, [{reply, From, {error, closing}}]};
 handle_send_request(From, Method, Path, Headers, Opts, State) ->
@@ -1761,15 +1764,13 @@ finish_server_send(From, StreamId, ResumeActions, Budget, State) ->
     Actions = [{reply, From, ok} | ResumeActions],
     case maps:find(StreamId, State#state.streams) of
         {ok, #stream{state = closed}} when State#state.mode =:= server ->
-            enter_lingering_close(Actions, Budget, State);
+            %% Early response: the request body is still arriving.
+            server_close({shutdown, early_close}, Actions, Budget, true, State);
         error when State#state.mode =:= server ->
             case closes_after(StreamId, State) of
-                %% Input past the last request is waiting: stage the close
-                %% so a reset cannot wipe out this response (RFC 9112 §9.6).
-                true when State#state.unread ->
-                    enter_lingering_close(Actions, Budget, State);
                 true ->
-                    {stop_and_reply, {shutdown, goaway_sent}, Actions, State};
+                    server_close({shutdown, goaway_sent}, Actions, Budget,
+                                 input_pending(StreamId, State), State);
                 false ->
                     {keep_state, State, Actions}
             end;
@@ -1788,7 +1789,7 @@ server_cancel(From, StreamId, #state{streams = Streams} = State) ->
         [] ->
             cancel_close(Reply, StreamId, State);
         Earlier ->
-            State1 = mark_close_stream(lists:min(Earlier), State),
+            State1 = mark_last(lists:min(Earlier), State),
             Current = case State1#state.current_stream of
                 StreamId -> undefined;
                 Other -> Other
@@ -1798,49 +1799,49 @@ server_cancel(From, StreamId, #state{streams = Streams} = State) ->
             {keep_state, State2, [Reply | clear_request_timeout()]}
     end.
 
-%% Close now for a cancelled stream with no earlier response owed. When input
-%% may still be arriving (a request body not fully read, or bytes past it),
-%% closing outright would make TCP answer that input with a reset, and the
-%% client could lose the response bytes already written (RFC 9112 §9.6).
-%% Then the close is staged as after an early response: shut the write side
-%% and drain within the budget. The stream is dropped first, so nothing more
-%% is sent on it, and the stop reason stays `{shutdown, stream_cancelled}'.
-cancel_close(Reply, StreamId, #state{streams = Streams} = State) ->
-    State1 = State#state{streams = maps:remove(StreamId, Streams),
-                         current_stream = undefined,
-                         linger_reason = {shutdown, stream_cancelled}},
-    case input_pending(StreamId, State) of
-        false ->
-            {stop_and_reply, {shutdown, stream_cancelled}, [Reply], State};
-        true ->
-            enter_lingering_close([Reply], State#state.drain_budget, State1)
-    end.
+%% A cancelled stream with no earlier response owed: close now. No more is
+%% sent on it, since the process stops or drains (where every call is
+%% refused).
+cancel_close(Reply, StreamId, State) ->
+    server_close({shutdown, stream_cancelled}, [Reply], State#state.drain_budget,
+                 input_pending(StreamId, State), State).
 
+%% The one way a server closes once its last response is decided: at once
+%% when no input can be left unread, otherwise staged. Closing with unread
+%% input makes TCP answer it with a reset, and the client can then lose the
+%% response bytes it has not read yet (RFC 9112 §9.6). A staged close shuts
+%% the write side and drains within `Budget' (enter_lingering_close/3).
+%% Either way the process stops with `Reason'.
+server_close(Reason, Actions, _Budget, false, State) ->
+    {stop_and_reply, Reason, Actions, State};
+server_close(Reason, Actions, Budget, true, State) ->
+    enter_lingering_close(Actions, Budget, State#state{close_reason = Reason}).
+
+%% True when input may still be on its way once the response on `StreamId'
+%% is the last: its own request body is unfinished, another request was read
+%% and not answered, input past the last request was read, or the parser
+%% holds bytes it has not used.
 input_pending(StreamId, #state{streams = Streams} = State) ->
-    Unfinished = case maps:find(StreamId, Streams) of
-        {ok, #stream{recv_ended = false}} -> true;
-        _ -> false
-    end,
-    Unfinished orelse State#state.unread
-        orelse lists:any(fun(K) -> K > StreamId end, maps:keys(Streams))
-        orelse parser_holds_input(State).
+    Other = fun(Id, #stream{recv_ended = Ended}) ->
+                Id =/= StreamId orelse not Ended
+            end,
+    State#state.unread
+        orelse parser_holds_input(State)
+        orelse maps:size(maps:filter(Other, Streams)) > 0.
 
 %% Close for a cancelled request. Responses to earlier pipelined requests
 %% are still owed and are read first: the cancelled stream is kept as the
-%% point where the connection closes (`close_stream'), nothing more is sent
+%% point where the connection closes (`close_at'), nothing more is sent
 %% on it and no new request is accepted. Its own response is never read.
 %% The stop reason is `normal', as for close/1: the owner asked for it, and
 %% the connection is linked to an owner that may not trap exits.
 client_cancel(From, #stream{id = StreamId} = Stream, State) ->
     Reply = {reply, From, ok},
-    %% The earliest cancelled request is where the connection closes: a
-    %% later cancel must not move it, or the response to the earlier one
-    %% would be read and delivered after its reset.
-    Close = case State#state.close_stream of
-        undefined -> StreamId;
-        Earlier -> min(Earlier, StreamId)
-    end,
-    case cancel_due(State#state{close_stream = Close}) of
+    %% The close point only moves down: a later cancel must not move it, or
+    %% the response to an earlier cancelled request would be read and
+    %% delivered after its reset.
+    CloseAt = lower_close_at(StreamId, State),
+    case cancel_due(State#state{close_at = CloseAt}) of
         true ->
             Waiting = case Stream#stream.upgrade_from of
                 undefined -> [];
@@ -1851,33 +1852,47 @@ client_cancel(From, #stream{id = StreamId} = Stream, State) ->
             Stream1 = Stream#stream{state = closed, closed_reason = cancel,
                                     pending_body = undefined},
             State1 = put_stream(Stream1, State),
-            {keep_state, State1#state{close_stream = Close,
+            {keep_state, State1#state{close_at = CloseAt,
                                       close_after = true}, [Reply]}
     end.
 
-%% Client: true when the cancelled request is the next one to be answered,
-%% so no earlier response is still owed.
-cancel_due(#state{mode = client, close_stream = Id, pending = Q})
-  when Id =/= undefined ->
-    queue:peek(Q) =:= {value, Id};
+%% Client: true once every response below the close point has been read.
+cancel_due(#state{mode = client, close_at = CloseAt, pending = Q})
+  when CloseAt =/= undefined ->
+    case queue:peek(Q) of
+        {value, Next} -> Next >= CloseAt;
+        empty -> true
+    end;
 cancel_due(_State) ->
     false.
 
+%% The close point after `Candidate': it only moves down.
+lower_close_at(Candidate, #state{close_at = undefined}) -> Candidate;
+lower_close_at(Candidate, #state{close_at = CloseAt}) -> min(Candidate, CloseAt).
+
+%% True when `StreamId' is below the close point, so it is still served.
+served(_StreamId, #state{close_at = undefined}) -> true;
+served(StreamId, #state{close_at = CloseAt}) -> StreamId < CloseAt.
+
+%% True when `StreamId' is the last stream served.
+last_served(StreamId, State) ->
+    served(StreamId, State) andalso not served(StreamId + 1, State).
+
 %% The handler's own `Connection: close' makes this response the last.
-handler_close(true, StreamId, State) -> mark_close_stream(StreamId, State);
+handler_close(true, StreamId, State) -> mark_last(StreamId, State);
 handler_close(false, _StreamId, State) -> State.
 
 %% True when the response on StreamId is the last on this connection.
-closes_after(StreamId, #state{close_after = CloseAfter, close_stream = Last}) ->
-    CloseAfter orelse StreamId =:= Last.
+closes_after(StreamId, #state{close_after = CloseAfter} = State) ->
+    CloseAfter orelse last_served(StreamId, State).
 
-%% A response carrying `Connection: close' is the last one on this
-%% connection (RFC 9112 §9.6). An earlier last stream stays the last.
-mark_close_stream(Id, #state{close_stream = Last} = State)
-  when is_integer(Last), Last =< Id ->
+%% Make the response on `Id' the last one on this connection (RFC 9112
+%% §9.6). An earlier last stream stays the last.
+mark_last(Id, #state{close_at = CloseAt} = State)
+  when is_integer(CloseAt), CloseAt =< Id + 1 ->
     State;
-mark_close_stream(Id, #state{streams = Streams} = State) ->
-    State1 = State#state{close_stream = Id},
+mark_last(Id, #state{streams = Streams} = State) ->
+    State1 = State#state{close_at = Id + 1},
     case maps:find(Id, Streams) of
         {ok, #stream{recv_ended = false}} ->
             %% Its request is still arriving; reading stops once it is done.
@@ -1922,8 +1937,7 @@ discard_limit(disabled) -> 0.
 %% reset mid-upload — the explicit opt-out).
 enter_lingering_close(ReplyActions, disabled, State) ->
     _ = sock_shutdown_write(State),
-    {stop_and_reply, linger_stop({shutdown, early_close}, State),
-     ReplyActions, State};
+    {stop_and_reply, State#state.close_reason, ReplyActions, State};
 enter_lingering_close(ReplyActions, {MaxBytes, MaxMs}, State) ->
     _ = sock_shutdown_write(State),
     State1 = set_active_once(State#state{drain_left = MaxBytes}),
@@ -1943,11 +1957,8 @@ drain_discard(Data, #state{drain_left = Left} = State) ->
         Remaining when Remaining > 0 ->
             {keep_state, set_active_once(State#state{drain_left = Remaining})};
         _ ->
-            {stop, linger_stop({shutdown, drain_budget_exhausted}, State), State}
+            {stop, State#state.close_reason, State}
     end.
-
-linger_stop(Default, #state{linger_reason = undefined}) -> Default;
-linger_stop(_Default, #state{linger_reason = Reason}) -> Reason.
 
 %% A response to HEAD and any 1xx, 204 or 304 ends at the blank line after
 %% its header block, whatever its framing headers say (RFC 9112 §6.3 item 1,
@@ -2221,8 +2232,8 @@ handle_continue(From, StreamId, State) ->
 %% ----------------------------------------------------------------------------
 
 handle_client_upgrade(From, _Protocol, _Headers,
-                      #state{close_stream = Cancelled})
-  when Cancelled =/= undefined ->
+                      #state{close_at = CloseAt})
+  when CloseAt =/= undefined ->
     %% Closing for a cancelled request, as in handle_send_request/6: writing
     %% the upgrade request or resetting the parser would corrupt the
     %% response still being read.

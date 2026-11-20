@@ -136,6 +136,7 @@ must not lose bytes or close events queued in the mailbox.
 - `include/h1.hrl`: shared records, defaults and limits
 - `docs/features.md`: feature matrix and API reference
 - `docs/ranch.md`: running h1 under Ranch
+- `docs/closing.md`: when and how a connection closes (close point, staged close, stop reasons)
 - `README.md`: usage and examples
 
 ### Test Organization

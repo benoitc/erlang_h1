@@ -880,7 +880,7 @@ Useful for embedding HTTP/1.1 into Erlang applications that also want the h2 / h
 - `Upgrade: h2c` cleartext negotiation (deprecated by RFC 9113); use ALPN with `h2` directly instead.
 - Proxy-specific semantics beyond the `Upgrade` and `CONNECT 200` primitives (upstream routing, forward-proxy ACLs, `Proxy-Authorization`). `accept_upgrade` and `accept_connect` hand the socket off; the rest belongs in the proxy library. WebSocket / `h2c`-over-Upgrade framing is explicitly out of scope.
 
-See `docs/features.md` for the full RFC coverage + gap list.
+See `docs/features.md` for the full RFC coverage + gap list, and `docs/closing.md` for when and how a connection closes.
 
 ## License
 

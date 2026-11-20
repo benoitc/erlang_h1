@@ -191,27 +191,9 @@ start_handler(Conn, StreamId, Method, Path, Headers, Handler) ->
             Class:Reason:Stack ->
                 error_logger:error_msg("h1 handler crashed: ~p:~p~n~p~n",
                                        [Class, Reason, Stack]),
-                try internal_error(Conn, StreamId) catch _:_ -> ok end
+                h1:internal_error(Conn, StreamId)
         end
     end).
-
-%% Answer 500 for a crashed handler. If the handler had already started its
-%% response, a 500 cannot follow it, and writing the error text would only
-%% complete that response as if it had succeeded: cancel it instead, so the
-%% client sees it cut short. A response that already ended is left alone.
-internal_error(Conn, StreamId) ->
-    case h1_connection:send_response(
-           Conn, StreamId, 500,
-           [{<<"content-length">>, <<"21">>},
-            {<<"content-type">>, <<"text/plain">>}]) of
-        ok ->
-            h1_connection:send_data(Conn, StreamId,
-                                    <<"Internal Server Error">>, true);
-        {error, response_already_sent} ->
-            h1_connection:cancel_stream(Conn, StreamId);
-        {error, _} ->
-            ok
-    end.
 
 invoke(Fun, Conn, StreamId, Method, Path, Headers) when is_function(Fun, 5) ->
     Fun(Conn, StreamId, Method, Path, Headers);
