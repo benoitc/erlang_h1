@@ -74,14 +74,20 @@ start_handler(Conn, Id, Method, Path, Headers, Handler) ->
         catch Class:Reason:Stack ->
             error_logger:error_msg("ranch-h1 handler crash ~p:~p~n~p~n",
                                    [Class, Reason, Stack]),
-            try h1:send_response(Conn, Id, 500,
-                [{<<"content-length">>, <<"21">>},
-                 {<<"content-type">>, <<"text/plain">>}])
-            catch _:_ -> ok end,
-            try h1:send_data(Conn, Id, <<"Internal Server Error">>, true)
-            catch _:_ -> ok end
+            try internal_error(Conn, Id) catch _:_ -> ok end
         end
     end).
+
+%% A response already started cannot be followed by a 500: cancel it so the
+%% client sees it cut short, instead of the error text ending it.
+internal_error(Conn, Id) ->
+    case h1:send_response(Conn, Id, 500,
+                          [{<<"content-length">>, <<"21">>},
+                           {<<"content-type">>, <<"text/plain">>}]) of
+        ok -> h1:send_data(Conn, Id, <<"Internal Server Error">>, true);
+        {error, response_already_sent} -> h1:cancel(Conn, Id);
+        {error, _} -> ok
+    end.
 
 invoke(Fun, Conn, Id, M, P, Hs) when is_function(Fun, 5) ->
     Fun(Conn, Id, M, P, Hs);

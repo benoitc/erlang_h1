@@ -441,8 +441,10 @@ server_port({_, _, Port}) -> Port.
 %% connection once it ends and does not process later requests. The same
 %% holds for respond/5,6.
 %%
-%% A stream takes one final response: a second send_response/4 or
-%% respond/5,6 returns `{error, response_already_sent}' and writes nothing.
+%% A stream takes one final response: while that response is in progress,
+%% a second send_response/4 or respond/5,6 returns
+%% `{error, response_already_sent}' and writes nothing. Once it has ended
+%% the stream is gone and those calls return `{error, unknown_stream}'.
 %% Interim (1xx) responses before the final one are not counted.
 %%
 %% Once the connection is gone (the client left, the last response was
@@ -542,11 +544,19 @@ consume(Conn, StreamId, Bytes) ->
 %% then end of file, and records the response as incomplete (RFC 9112 §8).
 %% The connection process stops with `{shutdown, stream_cancelled}', so
 %% later send calls on it exit as after any other close. Pipelined requests
-%% behind the cancelled one are dropped with the connection.
+%% behind the cancelled one are dropped with the connection, and their
+%% handlers never run.
+%%
+%% If the request body is still arriving, or more input follows it, the
+%% connection first shuts its write side and reads and discards that input
+%% within the `early_response_drain' budget, so the client is not reset
+%% before it reads what was sent. Send calls during that drain return
+%% `{error, closed}'.
 %%
 %% When an earlier pipelined response is still pending, that response is
 %% allowed to end first and is the last one on the connection; sends on the
-%% cancelled stream return `{error, unknown_stream}'.
+%% cancelled stream return `{error, unknown_stream}', and its handler never
+%% runs if it had not started.
 %%
 %% Cancelling a stream whose response already ended writes nothing; the
 %% connection closes after the next response.
@@ -558,9 +568,10 @@ consume(Conn, StreamId, Bytes) ->
 %% close/1, and the owner receives `{closed, normal}'.
 %%
 %% When earlier pipelined requests are still waiting for their responses,
-%% those are delivered first and the connection closes after them. Until
-%% then send_data/3,4 and send_trailers/3 on the cancelled request return
-%% `{error, cancelled}' and a new request returns `{error, closing}'.
+%% those are delivered first and the connection closes after them, at the
+%% earliest cancelled request. Until then send_data/3,4 and send_trailers/3
+%% on a cancelled request return `{error, cancelled}', and a new request or
+%% upgrade/3,4 returns `{error, closing}'.
 %% Requests pipelined behind the cancelled one are dropped with the
 %% connection.
 cancel(Conn, StreamId) ->
@@ -668,6 +679,12 @@ controlling_process(Conn, Pid) ->
 %% ============================================================================
 
 %% @doc Client: send an Upgrade request and wait for 101 Switching Protocols.
+%%
+%% The connection must be idle: while responses to earlier requests are
+%% still arriving this returns `{error, requests_pending}' and writes
+%% nothing. While the upgrade waits for its answer, h1:request/3,4,5 returns
+%% `{error, upgrade_pending}', since bytes after it would belong to the new
+%% protocol once the server switches (RFC 9110 §7.8).
 -spec upgrade(connection(), binary(), headers()) ->
     {ok, stream_id(), term(), binary(), headers()} | {error, term()}.
 upgrade(Conn, Protocol, Headers) ->

@@ -781,9 +781,11 @@ Failures return `{error, Reason}` from API calls or appear as `{closed, Reason}`
 | `bad_request` | malformed request line, status line, or version |
 | `idle_timeout` / `request_timeout` | connection/request was silent past its cap |
 | `stream_cancelled` | server: `h1:cancel/2,3` on a response that had not ended closed the connection |
-| `cancelled` / `closing` | client: a send on a cancelled request, or a new request while the connection closes for a cancel |
-| `response_already_sent` | a second final response on a stream that already sent one |
+| `cancelled` / `closing` | client: a send on a cancelled request, or a new request or upgrade while the connection closes for a cancel |
+| `response_already_sent` | a second final response on a stream whose response is still in progress (once it has ended: `unknown_stream`) |
 | `pipeline_disabled` | `pipeline => false` and a prior request was still in flight |
+| `requests_pending` | client: `h1:upgrade/3,4` while responses to earlier requests are still arriving |
+| `upgrade_pending` | client: a new request while an upgrade waits for its answer |
 
 ## Using with Ranch
 
