@@ -30,7 +30,7 @@ Input that arrives after the last request is read and discarded, never parsed.
 Once the last response is on the wire, the server closes **at once** unless input may still be unread. Input may be unread when one of these holds:
 
 - the last request's body is still arriving;
-- another request was read and has not been answered;
+- another request was read and has not been answered, or pipelined input was read ahead and is held until the current response ends;
 - input past the last request was already read and discarded;
 - the parser holds bytes it has not used;
 - the request was malformed, so where it ends is unknown.

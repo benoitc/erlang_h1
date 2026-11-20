@@ -6,6 +6,15 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- A client could make a server read and queue any number of pipelined
+  requests while the first one was still being answered, growing the
+  server's memory without bound: 2.8 MB of small pipelined requests made
+  one connection hold about 88 MB. The server now reads the next pipelined
+  request only once the current response has ended, so TCP holds such a
+  client back and a connection holds at most one read of input ahead.
+
 ### Added
 
 - `h1:internal_error/2` answers a request whose handler failed: a 500
@@ -25,6 +34,16 @@ follow [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Responses to pipelined requests could be written into each other when a
+  handler returned before its response had ended, for example by handing
+  the rest of the response to another process. Pipelined requests are now
+  served one at a time, as Cowboy does, so responses always go out in
+  request order. Code that drives a connection directly now receives the
+  next pipelined request only after answering the current one.
+- Bytes a client sent right after a CONNECT request, before the handler
+  accepted it, were read as HTTP and answered with 400 when they looked
+  like a line. They are now held and returned with the socket, as the start
+  of the tunnel.
 - After a cancel, a pipelined request read behind the point where the
   server connection closes could still have its handler run, when the
   handler before it returned while its response was still being sent. That
