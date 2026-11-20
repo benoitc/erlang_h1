@@ -49,7 +49,7 @@
 
 ### Upgrade / 101 Switching Protocols (RFC 9110 §7.8)
 
-- Client: `h1:upgrade/3,4` writes a GET with `Connection: Upgrade` + `Upgrade: <token>`, blocks until either a 101 arrives (returning `{ok, StreamId, Socket, Buffer, Headers}`) or a non-101 response aborts it.
+- Client: `h1:upgrade/3,4` writes a GET with `Connection: Upgrade` + `Upgrade: <token>`, blocks until either a 101 arrives (returning `{ok, StreamId, Socket, Buffer, Headers}`) or a non-101 response aborts it. It needs an idle connection: with responses to earlier requests still arriving it returns `{error, requests_pending}`, and a request sent while it waits returns `{error, upgrade_pending}` (RFC 9110 §7.8).
 - Server: parser detects `Upgrade:` + `Connection: upgrade`, emits `{upgrade, StreamId, Proto, Method, Path, Headers}`, then pauses the socket so no bytes past the request are consumed. The handler calls `h1:accept_upgrade/3` to send the 101 and receive `{ok, Socket, Buffer}`.
 - Server: `Upgrade` on an HTTP/1.0 request is ignored (RFC 9110 §7.8). The request is delivered as a plain `{request, ...}` without the `Upgrade` header, and `h1:accept_upgrade/3` returns `{error, no_upgrade_header}`. `h1:request_version/2` tells a handler which version a request arrived with.
 - On either side, after a successful 101 the `gen_statem` stops with `{shutdown, upgraded}` and the socket is `controlling_process`'d to the caller, along with any leftover buffered bytes.

@@ -27,6 +27,11 @@ follow [Semantic Versioning](https://semver.org/).
   incoming body within the early response drain budget, then closes. Send
   calls on the cancelled stream return an error during that drain instead
   of exiting.
+- A client that called upgrade while responses to earlier requests were
+  still arriving corrupted those responses, and a request sent while an
+  upgrade waited for its answer went out on a connection about to switch
+  protocols. An upgrade now needs an idle connection and is refused
+  otherwise, and requests are refused while an upgrade is waiting.
 - The documentation said a second response on a stream is refused with
   `response_already_sent`. That holds while the first response is in
   progress; once it has ended the call returns `unknown_stream`.

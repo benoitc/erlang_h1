@@ -18,13 +18,19 @@
     upgrade_with_path_pseudo_header/1,
     upgrade_wire_path_in_request_line/1,
     accept_upgrade_dedupes_framing_headers/1,
-    http_1_0_upgrade_ignored/1
+    http_1_0_upgrade_ignored/1,
+    client_upgrade_refused_while_pending/1,
+    client_request_refused_while_upgrade_pending/1,
+    client_upgrade_after_responses/1
 ]).
 
 all() ->
     [upgrade_handshake, upgrade_capsule_exchange, upgrade_with_leftover_bytes,
      upgrade_with_path_pseudo_header, upgrade_wire_path_in_request_line,
-     accept_upgrade_dedupes_framing_headers, http_1_0_upgrade_ignored].
+     accept_upgrade_dedupes_framing_headers, http_1_0_upgrade_ignored,
+     client_upgrade_refused_while_pending,
+     client_request_refused_while_upgrade_pending,
+     client_upgrade_after_responses].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(h1),
@@ -343,3 +349,94 @@ start_server(Handler, Config) ->
     Opts = #{transport => tcp, handler => Handler, acceptors => 1},
     {ok, Ref} = h1:start_server(0, Opts),
     [{server_ref, Ref} | Config].
+
+%% ----------------------------------------------------------------------------
+%% Client upgrade on a busy connection
+%% ----------------------------------------------------------------------------
+%%
+%% The h1 client talks to a raw gen_tcp server held by the test, so the
+%% exact bytes it writes are visible.
+
+%% An upgrade while a response is still arriving is refused and writes
+%% nothing: it would take over the parser and corrupt that response. The
+%% response is then read whole.
+client_upgrade_refused_while_pending(_Config) ->
+    {Conn, Srv} = raw_client(),
+    {ok, Id} = h1:request(Conn, <<"GET">>, <<"/a">>, []),
+    _ = recv_until_headers(Srv),
+    ok = gen_tcp:send(Srv, <<"HTTP/1.1 200 OK\r\ncontent-length: 6\r\n\r\nabc">>),
+    ?assertMatch({response, Id, 200, _}, conn_event(Conn)),
+    ?assertEqual({data, Id, <<"abc">>, false}, conn_event(Conn)),
+    ?assertEqual({error, requests_pending},
+                 h1:upgrade(Conn, <<"demo">>, [], 1000)),
+    timer:sleep(50),
+    ok = gen_tcp:send(Srv, <<"def">>),
+    ?assertEqual({data, Id, <<"def">>, true}, conn_event(Conn)),
+    %% Nothing was written after the first request.
+    ?assertEqual({error, timeout}, gen_tcp:recv(Srv, 0, 300)),
+    h1:close(Conn),
+    gen_tcp:close(Srv).
+
+%% A request while an upgrade waits for its answer is refused: once the
+%% server switches protocols, its bytes would belong to the new protocol
+%% (RFC 9110 §7.8). The upgrade then completes as usual.
+client_request_refused_while_upgrade_pending(_Config) ->
+    {Conn, Srv} = raw_client(),
+    Test = self(),
+    spawn_link(fun() ->
+        Test ! {upgraded, h1:upgrade(Conn, <<"demo">>, [], 5000)}
+    end),
+    Request = recv_until_headers(Srv),
+    ?assertNotEqual(nomatch, binary:match(string:lowercase(Request),
+                                          <<"upgrade: demo">>)),
+    ?assertEqual({error, upgrade_pending},
+                 h1:request(Conn, <<"GET">>, <<"/b">>, [])),
+    ok = gen_tcp:send(Srv, <<"HTTP/1.1 101 Switching Protocols\r\n"
+                             "connection: upgrade\r\nupgrade: demo\r\n\r\n">>),
+    receive {upgraded, Result} -> ?assertMatch({ok, _, _, _, _}, Result)
+    after 5000 -> ct:fail(no_upgrade)
+    end,
+    %% The refused request never reached the server. The process that took
+    %% the socket has exited, so it may already be closed.
+    ?assertNotMatch({ok, _}, gen_tcp:recv(Srv, 0, 300)),
+    gen_tcp:close(Srv).
+
+%% Once the earlier response has been read, the connection is idle and the
+%% upgrade goes through on it.
+client_upgrade_after_responses(_Config) ->
+    {Conn, Srv} = raw_client(),
+    {ok, Id} = h1:request(Conn, <<"GET">>, <<"/a">>, []),
+    _ = recv_until_headers(Srv),
+    ok = gen_tcp:send(Srv, <<"HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\na">>),
+    ?assertMatch({response, Id, 200, _}, conn_event(Conn)),
+    ?assertEqual({data, Id, <<"a">>, true}, conn_event(Conn)),
+    Test = self(),
+    spawn_link(fun() ->
+        Test ! {upgraded, h1:upgrade(Conn, <<"demo">>, [], 5000)}
+    end),
+    _ = recv_until_headers(Srv),
+    ok = gen_tcp:send(Srv, <<"HTTP/1.1 101 Switching Protocols\r\n"
+                             "connection: upgrade\r\nupgrade: demo\r\n\r\n">>),
+    receive {upgraded, Result} -> ?assertMatch({ok, _, _, _, _}, Result)
+    after 5000 -> ct:fail(no_upgrade)
+    end,
+    gen_tcp:close(Srv).
+
+%% An h1 client connected to a raw server socket held by the test.
+raw_client() ->
+    {ok, L} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true},
+                                 {ip, {127,0,0,1}}]),
+    {ok, Port} = inet:port(L),
+    {ok, Conn} = h1:connect("127.0.0.1", Port, #{transport => tcp}),
+    {ok, Srv} = gen_tcp:accept(L, 5000),
+    ok = gen_tcp:close(L),
+    ok = h1:wait_connected(Conn),
+    {Conn, Srv}.
+
+%% The next response event for the connection, skipping `connected'.
+conn_event(Conn) ->
+    receive
+        {h1, Conn, connected} -> conn_event(Conn);
+        {h1, Conn, Event} -> Event
+    after 5000 -> ct:fail(no_event)
+    end.

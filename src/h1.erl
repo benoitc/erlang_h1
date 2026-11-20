@@ -679,6 +679,12 @@ controlling_process(Conn, Pid) ->
 %% ============================================================================
 
 %% @doc Client: send an Upgrade request and wait for 101 Switching Protocols.
+%%
+%% The connection must be idle: while responses to earlier requests are
+%% still arriving this returns `{error, requests_pending}' and writes
+%% nothing. While the upgrade waits for its answer, h1:request/3,4,5 returns
+%% `{error, upgrade_pending}', since bytes after it would belong to the new
+%% protocol once the server switches (RFC 9110 §7.8).
 -spec upgrade(connection(), binary(), headers()) ->
     {ok, stream_id(), term(), binary(), headers()} | {error, term()}.
 upgrade(Conn, Protocol, Headers) ->

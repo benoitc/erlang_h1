@@ -1518,8 +1518,31 @@ handle_send_request(From, _Method, _Path, _Headers, _Opts,
   when Cancelled =/= undefined ->
     %% Closing for a cancelled request: a new one would never be answered.
     {keep_state_and_data, [{reply, From, {error, closing}}]};
-handle_send_request(From, Method, Path, Headers, Opts,
-                    #state{pipeline_enabled = false, pending = Q} = State) ->
+handle_send_request(From, Method, Path, Headers, Opts, State) ->
+    case upgrade_waiting(State) of
+        true ->
+            %% Bytes after an Upgrade request belong to the new protocol
+            %% once the server answers 101 (RFC 9110 §7.8).
+            {keep_state_and_data, [{reply, From, {error, upgrade_pending}}]};
+        false ->
+            send_request_checked(From, Method, Path, Headers, Opts, State)
+    end.
+
+%% True while an Upgrade request waits for its response. An upgrade is only
+%% sent on an idle connection, so it is the first request in flight.
+upgrade_waiting(#state{pending = Q, streams = Streams}) ->
+    case queue:peek(Q) of
+        {value, Id} ->
+            case maps:find(Id, Streams) of
+                {ok, #stream{upgrade_from = From}} -> From =/= undefined;
+                error -> false
+            end;
+        empty ->
+            false
+    end.
+
+send_request_checked(From, Method, Path, Headers, Opts,
+                     #state{pipeline_enabled = false, pending = Q} = State) ->
     case queue:is_empty(Q) of
         false -> {keep_state_and_data,
                   [{reply, From, {error, pipeline_disabled}}]};
@@ -1527,7 +1550,7 @@ handle_send_request(From, Method, Path, Headers, Opts,
             handle_send_request_ok(From, Method, Path,
                                    inject_host(Headers, State), Opts, State)
     end;
-handle_send_request(From, Method, Path, Headers, Opts, State) ->
+send_request_checked(From, Method, Path, Headers, Opts, State) ->
     handle_send_request_ok(From, Method, Path,
                            inject_host(Headers, State), Opts, State).
 
@@ -2204,7 +2227,19 @@ handle_client_upgrade(From, _Protocol, _Headers,
     %% the upgrade request or resetting the parser would corrupt the
     %% response still being read.
     {keep_state_and_data, [{reply, From, {error, closing}}]};
-handle_client_upgrade(From, Protocol, Headers, State) ->
+handle_client_upgrade(From, Protocol, Headers, #state{pending = Q} = State) ->
+    case queue:is_empty(Q) of
+        true ->
+            send_client_upgrade(From, Protocol, Headers, State);
+        false ->
+            %% Responses to earlier requests are still arriving. The upgrade
+            %% takes over the parser and, on 101, the socket (RFC 9110 §7.8),
+            %% so it waits for an idle connection rather than corrupting the
+            %% response being read.
+            {keep_state_and_data, [{reply, From, {error, requests_pending}}]}
+    end.
+
+send_client_upgrade(From, Protocol, Headers, State) ->
     %% Ensure required headers are present.
     Hs0 = upsert(<<"connection">>, <<"Upgrade">>, Headers),
     Hs1 = upsert(<<"upgrade">>, Protocol, Hs0),
