@@ -169,17 +169,25 @@ Inside the server, `h1_server` re-routes `{h1, Conn, {data, …}}` / `{trailers,
 
 ## Testing
 
-- `rebar3 eunit` — 52 EUnit tests plus 4 PropEr roundtrip properties.
-- `rebar3 ct --suite=test/h1_parse_SUITE` — 24 streaming-parser cases (request, response, chunked, trailers, limits).
-- `rebar3 ct --suite=test/h1_message_SUITE` — 12 encoder cases.
-- `rebar3 ct --suite=test/h1_capsule_SUITE` — 9 capsule encode/decode cases.
-- `rebar3 ct --suite=test/h1_connection_SUITE` — 13 loopback `gen_statem` cases: GET / POST / chunked / trailers / keep-alive / pipelining / Expect / Upgrade / capsule exchange.
-- `rebar3 ct --suite=test/h1_e2e_SUITE` — 8 cases through the public API over real TCP + TLS.
-- `rebar3 ct --suite=test/h1_upgrade_SUITE` — 7 end-to-end upgrade cases with capsule framing, including HTTP/1.0 `Upgrade` being ignored.
-- `rebar3 ct --suite=test/h1_connect_SUITE` — 8 end-to-end CONNECT cases (authority-form targets, IPv6, ExtraHeaders round-trip, no-chunked-framing probe, socket ownership after handoff, `{shutdown, connected}` termination, error paths).
-- `rebar3 ct --suite=test/h1_bodyless_SUITE`: raw-socket cases for HEAD / 1xx / 204 / 304 responses on both sides, with the next response on the same connection, plus a PropEr property over status codes, methods, send paths and body shapes.
-- `rebar3 ct --suite=test/h1_cancel_SUITE`: raw-socket cases for a server cancel: chunked and `Content-Length` responses cut short, a cancel before any response byte, a cancel behind a pipelined response, and a second final response refused.
-- `rebar3 ct --suite=test/h1_close_SUITE`: raw-socket cases for closing: a pipelined request asking to close, a handler answering with `Connection: close`, and responses ended with trailers.
-- `rebar3 ct --suite=test/h1_flow_control_SUITE`: raw-socket cases for `flow_control => manual` on both sides: a reader that never reads, consuming content-length, chunked and (client) close-delimited bodies, `consume/3` after the body and on `auto`, an early 413, a handler that exits, pipelining and `request_timeout` while paused, and the client's connection-wide default.
-- `rebar3 ct --suite=test/h1_interop_SUITE` — curl / python3 / nginx probes, skipped when the binary is absent.
-- `rebar3 dialyzer` — clean.
+Run everything with `rebar3 eunit` and `rebar3 ct`; the case counts are in their output. To run one suite, use `rebar3 ct --suite=test/<name>`.
+
+- `rebar3 eunit`: in-module tests (`h1_parse_erl`, `h1_capsule`, `h1_varint`, `h1_error`) plus the PropEr roundtrip properties in `h1_prop_tests`.
+- `h1_parse_SUITE`: streaming-parser cases (request, response, chunked, trailers, limits).
+- `h1_message_SUITE`: encoder cases.
+- `h1_capsule_SUITE`: capsule encode/decode cases.
+- `h1_compliance_SUITE`: RFC 9110 / RFC 9112 vectors, accept and reject, taken from the RFC examples and public test corpora.
+- `h1_connection_SUITE`: loopback `gen_statem` cases: GET / POST / chunked / trailers / keep-alive / pipelining / Expect / Upgrade / capsule exchange.
+- `h1_e2e_SUITE`: the public API over real TCP and TLS.
+- `h1_upgrade_SUITE`: end-to-end upgrade cases with capsule framing, including HTTP/1.0 `Upgrade` being ignored.
+- `h1_connect_SUITE`: end-to-end CONNECT cases (authority-form targets, IPv6, ExtraHeaders round-trip, no-chunked-framing probe, socket ownership after handoff, `{shutdown, connected}` termination, error paths).
+- `h1_handover_SUITE`: bytes and close events survive the socket handover of `accept_upgrade/3` and `accept_connect/3,4`, over TCP and TLS.
+- `h1_bodyless_SUITE`: raw-socket cases for HEAD / 1xx / 204 / 304 responses on both sides, with the next response on the same connection, plus a PropEr property over status codes, methods, send paths and body shapes.
+- `h1_cancel_SUITE`: raw-socket cases for a server cancel: chunked and `Content-Length` responses cut short, a cancel before any response byte, a cancel behind a pipelined response, and a second final response refused.
+- `h1_close_SUITE`: raw-socket cases for closing: a pipelined request asking to close, a handler answering with `Connection: close`, and responses ended with trailers.
+- `h1_flow_control_SUITE`: raw-socket cases for `flow_control => manual` on both sides: a reader that never reads, consuming content-length, chunked and (client) close-delimited bodies, `consume/3` after the body and on `auto`, an early 413, a handler that exits, pipelining and `request_timeout` while paused, and the client's connection-wide default.
+- `h1_listener_owner_SUITE`: a server keeps accepting after the process that started it exits.
+- `h1_peercert_SUITE`: `h1:peercert/1` on the server and the client.
+- `h1_serve_socket_SUITE`: `h1:serve_socket/2` with a socket the caller accepted, over TCP and TLS with ALPN.
+- `h1_ranch_SUITE`: the h1 client against a Ranch listener embedding `h1_connection`, as in `docs/ranch.md`.
+- `h1_interop_SUITE`: curl / python3 / nginx probes, skipped when the tool is absent.
+- `rebar3 dialyzer`: clean.

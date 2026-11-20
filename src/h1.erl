@@ -444,6 +444,13 @@ server_port({_, _, Port}) -> Port.
 %% A stream takes one final response: a second send_response/4 or
 %% respond/5,6 returns `{error, response_already_sent}' and writes nothing.
 %% Interim (1xx) responses before the final one are not counted.
+%%
+%% Once the connection is gone (the client left, the last response was
+%% sent, the stream was cancelled), this call and send_data/3,4,
+%% send_trailers/3 and respond/5,6 exit instead of returning an error,
+%% with `noproc' or the connection's `{shutdown, Reason}'. A handler that
+%% can outlive its connection catches that exit or stops on the stream
+%% reset it receives.
 send_response(Conn, StreamId, Status, Headers) ->
     h1_connection:send_response(Conn, StreamId, Status, Headers).
 
@@ -543,6 +550,11 @@ consume(Conn, StreamId, Bytes) ->
 %%
 %% Cancelling a stream whose response already ended writes nothing; the
 %% connection closes after the next response.
+%%
+%% On a client, cancel does not close anything: the owner receives the
+%% stream reset, the connection stays usable for further requests, and the
+%% response to the cancelled request is still read and delivered when the
+%% server sends it. Call close/1 to stop waiting for it.
 cancel(Conn, StreamId) ->
     h1_connection:cancel_stream(Conn, StreamId).
 
