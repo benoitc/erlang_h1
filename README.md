@@ -847,9 +847,8 @@ For a production-shaped protocol module (per-request handler supervision, pipeli
 
 ```bash
 rebar3 compile
-rebar3 eunit          # 52 tests + 4 PropEr roundtrip properties
-rebar3 ct             # 159 CT cases across parse / message / capsule / connection
-                      # / e2e / upgrade / connect / interop / compliance
+rebar3 eunit          # in-module tests + PropEr roundtrip properties
+rebar3 ct             # Common Test suites, listed in docs/features.md
 rebar3 dialyzer       # clean
 rebar3 ex_doc         # HTML docs under doc/
 ```
