@@ -4,6 +4,30 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- A server handler that cancelled a response it had started left the
+  connection open with an unfinished response on it, so the client waited
+  for the rest of the body until a timeout. HTTP/1.1 can only signal an
+  abandoned response by closing, so cancelling a stream whose response has
+  not ended now closes the connection: the client reads what was sent, then
+  end of file, and knows the response is incomplete. The same applies when
+  no response byte was sent yet. Pipelined requests waiting behind the
+  cancelled one are dropped with the connection. The handler is notified as
+  before.
+- A handler on a server started with `h1:start_server/2,3` was usually not
+  told when its client disconnected in the middle of a request. It now
+  receives the stream reset, as handlers under `h1:serve_socket/2` already
+  did.
+- After a cancel, later send calls on the stream could still write to the
+  socket. Nothing is written once a stream is cancelled.
+- Sending a second final response on a stream wrote a second status line
+  into the body of the first. It is now refused with
+  `response_already_sent`. Interim (1xx) responses before the final one
+  still work.
+
 ## [0.11.1] - 2026-11-19
 
 ### Fixed

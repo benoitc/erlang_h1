@@ -58,6 +58,10 @@ handle_accepted(Socket, gen_tcp, Handler, ConnOpts, ServerOpts) ->
     run_connection(Socket, gen_tcp, Handler, ConnOpts, ServerOpts).
 
 run_connection(Socket, Transport, Handler, ConnOpts, ServerOpts) ->
+    %% The loop is linked to its h1_connection. Trap its exit so the events
+    %% it sent before stopping (a stream reset, a close) are still read and
+    %% forwarded to the handler, instead of this loop dying with them unread.
+    process_flag(trap_exit, true),
     case h1_connection:start_link(server, Socket, self(), ConnOpts) of
         {ok, Conn} ->
             case transfer(Transport, Socket, Conn) of
