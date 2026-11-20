@@ -750,7 +750,7 @@ Messages delivered to the owner (connect caller on the client side; `h1_server` 
 | `{h1, Conn, {trailers,      Id, Headers}}` | chunked body trailers; implies end-of-stream | |
 | `{h1, Conn, {upgrade,       Id, Proto, Method, Path, Headers}}` | server: peer requested Upgrade | |
 | `{h1, Conn, {upgraded,      Id, Proto, Socket, Buffer, Headers}}` | after 101 handoff | |
-| `{h1, Conn, {stream_reset,  Id, Reason}}` | stream cancelled; on a server the connection then closes | |
+| `{h1, Conn, {stream_reset,  Id, Reason}}` | stream cancelled; the connection then closes | |
 | `{h1, Conn, {goaway,        LastId, Reason}}` | peer signaled shutdown | |
 | `{h1, Conn, {closed,        Reason}}` | connection closed | |
 
@@ -781,6 +781,7 @@ Failures return `{error, Reason}` from API calls or appear as `{closed, Reason}`
 | `bad_request` | malformed request line, status line, or version |
 | `idle_timeout` / `request_timeout` | connection/request was silent past its cap |
 | `stream_cancelled` | server: `h1:cancel/2,3` on a response that had not ended closed the connection |
+| `cancelled` / `closing` | client: a send on a cancelled request, or a new request while the connection closes for a cancel |
 | `response_already_sent` | a second final response on a stream that already sent one |
 | `pipeline_disabled` | `pipeline => false` and a prior request was still in flight |
 

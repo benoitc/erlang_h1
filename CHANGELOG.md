@@ -17,6 +17,12 @@ follow [Semantic Versioning](https://semver.org/).
   no response byte was sent yet. Pipelined requests waiting behind the
   cancelled one are dropped with the connection. The handler is notified as
   before.
+- A client that cancelled a request kept the connection open: the response
+  to the cancelled request was still delivered, and a server waiting for
+  the rest of a request body kept waiting. Cancelling a request whose
+  response has not ended now closes the connection, after the responses to
+  earlier pipelined requests have been delivered. The connection stops
+  normally, as it does after `h1:close/1`.
 - A handler on a server started with `h1:start_server/2,3` was usually not
   told when its client disconnected in the middle of a request. It now
   receives the stream reset, as handlers under `h1:serve_socket/2` already

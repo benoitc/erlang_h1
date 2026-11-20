@@ -1,7 +1,7 @@
 %% Copyright (c) 2026 Benoit Chesneau.
 %% SPDX-License-Identifier: Apache-2.0
 %%
-%%% @doc Cancelling a stream on the server side.
+%%% @doc Cancelling a stream, on the server and on the client.
 %%%
 %%% HTTP/1.1 has no stream reset: a server that will not finish a response
 %%% can only say so by closing the connection, and the client then records
@@ -10,7 +10,8 @@
 %%% response has not ended therefore closes the connection, whether or not
 %%% a response byte went out. A response that ends normally keeps the
 %%% connection alive, and a client that leaves is still reported to the
-%%% handler.
+%%% handler. A client that cancels a request closes the connection as well,
+%%% once the responses to earlier pipelined requests have been read.
 %%%
 %%% Each case drives a raw gen_tcp client and asserts the exact bytes.
 -module(h1_cancel_SUITE).
@@ -32,7 +33,12 @@
     complete_response_keeps_alive/1,
     client_disconnect_reported/1,
     second_final_response_refused/1,
-    interim_then_final_response/1
+    interim_then_final_response/1,
+    client_cancel_before_response/1,
+    client_cancel_mid_response/1,
+    client_cancel_mid_upload/1,
+    client_cancel_pipelined/1,
+    client_cancel_finished_stream/1
 ]).
 
 all() ->
@@ -41,7 +47,10 @@ all() ->
      cancel_sends_write_nothing, cancel_later_pipelined_stream,
      cancel_finished_stream, complete_response_keeps_alive,
      client_disconnect_reported,
-     second_final_response_refused, interim_then_final_response].
+     second_final_response_refused, interim_then_final_response,
+     client_cancel_before_response, client_cancel_mid_response,
+     client_cancel_mid_upload, client_cancel_pipelined,
+     client_cancel_finished_stream].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(h1),
@@ -276,8 +285,125 @@ interim_then_final_response(Config) ->
     gen_tcp:close(Sock).
 
 %% ----------------------------------------------------------------------------
+%% Client cancel
+%% ----------------------------------------------------------------------------
+%%
+%% The h1 client talks to a raw gen_tcp server, so the close is visible. A
+%% client that abandons a request closes the connection too: otherwise the
+%% server keeps sending the response, or keeps waiting for the request body.
+%% The connection stops with `normal', as after close/1, so an owner that
+%% does not trap exits survives its own cancel.
+
+%% No response byte yet: the server reads end of file, and the owner gets
+%% the reset and then the close.
+client_cancel_before_response(_Config) ->
+    {Conn, Srv} = client(),
+    {ok, Id} = h1:request(Conn, <<"GET">>, <<"/a">>, []),
+    {ok, _Request} = gen_tcp:recv(Srv, 0, 5000),
+    ok = h1:cancel(Conn, Id),
+    ?assertEqual({error, closed}, gen_tcp:recv(Srv, 0, 3000)),
+    ?assertEqual([{stream_reset, Id, cancel},
+                  {closed, normal}],
+                 events(Conn)).
+
+%% In the middle of a response body: nothing of the response is delivered
+%% after the reset, and the connection closes.
+client_cancel_mid_response(_Config) ->
+    {Conn, Srv} = client(),
+    {ok, Id} = h1:request(Conn, <<"GET">>, <<"/a">>, []),
+    {ok, _Request} = gen_tcp:recv(Srv, 0, 5000),
+    ok = gen_tcp:send(Srv, <<"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\none">>),
+    ?assertMatch({response, Id, 200, _}, event(Conn)),
+    ?assertEqual({data, Id, <<"one">>, false}, event(Conn)),
+    ok = h1:cancel(Conn, Id),
+    ?assertEqual({error, closed}, gen_tcp:recv(Srv, 0, 3000)),
+    ?assertEqual([{stream_reset, Id, cancel},
+                  {closed, normal}],
+                 events(Conn)).
+
+%% In the middle of a request body: the server sees the close instead of
+%% waiting for the rest.
+client_cancel_mid_upload(_Config) ->
+    {Conn, Srv} = client(),
+    {ok, Id} = h1:request(Conn, <<"POST">>, <<"/up">>,
+                          [{<<"content-length">>, <<"10">>}]),
+    ok = h1:send_data(Conn, Id, <<"abc">>, false),
+    ok = h1:cancel(Conn, Id),
+    {closed, Sent} = recv_all(Srv),
+    ?assertEqual(<<"abc">>, binary:part(Sent, byte_size(Sent), -3)),
+    ?assertEqual([{stream_reset, Id, cancel},
+                  {closed, normal}],
+                 events(Conn)).
+
+%% The second of two pipelined requests is cancelled: the first response is
+%% still owed and is delivered whole. The second is never delivered, although
+%% the server wrote both in one segment, and the connection then closes.
+client_cancel_pipelined(_Config) ->
+    {Conn, Srv} = client(),
+    {ok, Id1} = h1:request(Conn, <<"GET">>, <<"/a">>, []),
+    {ok, Id2} = h1:request(Conn, <<"POST">>, <<"/b">>,
+                           [{<<"content-length">>, <<"3">>}]),
+    ok = h1:cancel(Conn, Id2),
+    ?assertEqual({stream_reset, Id2, cancel}, event(Conn)),
+    %% Nothing more goes out on the cancelled request, and no new request
+    %% is taken.
+    ?assertEqual({error, cancelled}, h1:send_data(Conn, Id2, <<"abc">>, true)),
+    ?assertEqual({error, closing}, h1:request(Conn, <<"GET">>, <<"/c">>, [])),
+    ok = gen_tcp:send(Srv, [resp(<<"a">>), resp(<<"b">>)]),
+    {closed, Sent} = recv_all(Srv),
+    ?assertEqual(nomatch, binary:match(Sent, <<"abc">>)),
+    ?assertEqual(nomatch, binary:match(Sent, <<"/c">>)),
+    ?assertMatch([{response, Id1, 200, _},
+                  {data, Id1, <<"a">>, true},
+                  {closed, normal}],
+                 events(Conn)).
+
+%% A request whose response already ended has nothing left to abandon: the
+%% connection serves the next request.
+client_cancel_finished_stream(_Config) ->
+    {Conn, Srv} = client(),
+    {ok, Id1} = h1:request(Conn, <<"GET">>, <<"/a">>, []),
+    {ok, _} = gen_tcp:recv(Srv, 0, 5000),
+    ok = gen_tcp:send(Srv, resp(<<"a">>)),
+    ?assertMatch({response, Id1, 200, _}, event(Conn)),
+    ?assertEqual({data, Id1, <<"a">>, true}, event(Conn)),
+    ok = h1:cancel(Conn, Id1),
+    {ok, Id2} = h1:request(Conn, <<"GET">>, <<"/b">>, []),
+    {ok, _} = gen_tcp:recv(Srv, 0, 5000),
+    ok = gen_tcp:send(Srv, resp(<<"b">>)),
+    ?assertMatch({response, Id2, 200, _}, event(Conn)),
+    ?assertEqual({data, Id2, <<"b">>, true}, event(Conn)),
+    h1:close(Conn),
+    gen_tcp:close(Srv).
+
+%% ----------------------------------------------------------------------------
 %% Helpers
 %% ----------------------------------------------------------------------------
+
+%% An h1 client connected to a raw server socket held by the test.
+client() ->
+    {ok, L} = gen_tcp:listen(0, [binary, {active, false}, {reuseaddr, true}]),
+    {ok, Port} = inet:port(L),
+    {ok, Conn} = h1:connect("127.0.0.1", Port, #{transport => tcp}),
+    {ok, Srv} = gen_tcp:accept(L, 5000),
+    ok = gen_tcp:close(L),
+    ok = h1:wait_connected(Conn),
+    receive {h1, Conn, connected} -> ok after 5000 -> ct:fail(not_connected) end,
+    {Conn, Srv}.
+
+%% The next event the client connection sent to its owner.
+event(Conn) ->
+    receive {h1, Conn, Event} -> Event
+    after 5000 -> ct:fail(no_event)
+    end.
+
+%% Every event up to the close, or up to a second of silence.
+events(Conn) ->
+    receive
+        {h1, Conn, {closed, _} = Event} -> [Event];
+        {h1, Conn, Event} -> [Event | events(Conn)]
+    after 1000 -> [still_open]
+    end.
 
 req(Path) ->
     [<<"GET ">>, Path, <<" HTTP/1.1\r\nhost: x\r\n\r\n">>].
