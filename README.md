@@ -450,7 +450,7 @@ Not calling `h1:continue/2` (and instead sending the final response directly) is
 
 ### Pipelining
 
-`h1_server` spawns one handler process per request but blocks the connection loop until that handler exits before accepting the next request. This guarantees pipelined response bytes are written in order, as required by RFC 9112 §9.3. Handlers still get their own mailbox for body streaming. Scale request-rate by raising `acceptors` (default: one per scheduler).
+`h1_server` spawns one handler process per request. Pipelined requests are served one at a time: the connection reads the next request only once the response to the current one has ended, so responses are written in order (RFC 9112 §9.3.2) even if a handler returns early and finishes its response from another process. Input read ahead is held and reading pauses, so TCP holds back a client that pipelines faster than it is answered. Handlers still get their own mailbox for body streaming. Scale request-rate by raising `acceptors` (default: one per scheduler).
 
 ### Serving a socket you accepted yourself
 

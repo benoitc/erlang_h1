@@ -162,6 +162,12 @@
     %% past N is discarded. Client: cancelling request N sets N.
     close_at               :: undefined | stream_id(),
     reading = parse        :: parse | discard,
+    %% Server: pipelined requests are served one at a time, as Cowboy does.
+    %% Once a request is read and its response has not ended, the input
+    %% after it is held here unparsed, and the socket is left passive as
+    %% soon as anything is held, so TCP holds the client back. `undefined':
+    %% not waiting for a response.
+    held = undefined       :: undefined | binary(),
     %% Server: input past the last request was read or discarded, so the
     %% close must be staged (lingering close) to avoid a reset.
     unread = false         :: boolean(),
@@ -579,6 +585,19 @@ handle_event({call, From}, _Msg, lingering_close, _State) ->
     %% The stream is finished and the connection is closing.
     {keep_state_and_data, [{reply, From, {error, closed}}]};
 
+%% --- pipelined input held behind a response ----------------------------------
+
+handle_event(internal, resume_input, open, #state{held = Held} = State)
+  when is_binary(Held) ->
+    State1 = State#state{held = undefined},
+    case Held of
+        %% Nothing held: the socket is still armed.
+        <<>> -> {keep_state, State1};
+        _ -> handle_socket_data(Held, State1)
+    end;
+handle_event(internal, resume_input, _S, _State) ->
+    keep_state_and_data;
+
 %% --- socket I/O -------------------------------------------------------------
 
 handle_event(info, {tcp, Sock, Data},
@@ -805,6 +824,8 @@ set_active_once(#state{socket = S, transport = ssl} = St) ->
 %% consume/3 or release_window/2 resumes reading. Only the parse path goes
 %% through here: the discard and lingering-close drains re-arm directly, so
 %% the window never stalls them.
+rearm(#state{held = Held} = St) when is_binary(Held), Held =/= <<>> ->
+    St;
 rearm(#state{recv_flow = auto} = St) ->
     set_active_once(St);
 rearm(St) ->
@@ -821,6 +842,8 @@ window_full(_St) ->
     false.
 
 %% Resume a paused socket once the window has room again.
+maybe_resume(#state{held = Held} = St) when is_binary(Held), Held =/= <<>> ->
+    St;
 maybe_resume(#state{recv_paused = true} = St) ->
     case window_full(St) of
         true  -> St;
@@ -985,6 +1008,12 @@ clear_request_timeout() ->
 
 handle_socket_data(Data, #state{mode = server, reading = discard} = State) ->
     discard_input(Data, State);
+handle_socket_data(Data, #state{mode = server, held = Held} = State)
+  when is_binary(Held) ->
+    %% Waiting for the response to the request before: keep this input
+    %% for later and stop reading.
+    {keep_state, State#state{held = <<Held/binary, Data/binary>>},
+     idle_timeout_actions(State)};
 handle_socket_data(Data, #state{parser = P, mode = Mode} = State) ->
     case drive_parser(h1_parse_erl:execute(P, Data), State, Mode) of
         {ok, #state{upgrade_pending = true} = State1} ->
@@ -1387,6 +1416,10 @@ after_message_done(Rest, #state{mode = server, current_stream = Id} = State) ->
             %% The next request is past the close point: do not process
             %% anything after this one (RFC 9112 §9.6).
             {ok, stop_reading(Rest =/= <<>>, State2)};
+        true when is_map_key(Id, State2#state.streams) ->
+            %% Its response has not ended: the next request waits, so
+            %% responses go out in request order (RFC 9112 §9.3.2).
+            {ok, State2#state{held = Rest}};
         true when Rest =/= <<>> ->
             drive_parser(h1_parse_erl:execute(State2#state.parser, Rest), State2, server);
         true ->
@@ -1772,11 +1805,18 @@ finish_server_send(From, StreamId, ResumeActions, Budget, State) ->
                     server_close({shutdown, goaway_sent}, Actions, Budget,
                                  input_pending(StreamId, State), State);
                 false ->
-                    {keep_state, State, Actions}
+                    {keep_state, State, Actions ++ resume_actions(State)}
             end;
         _ ->
             {keep_state, State, Actions}
     end.
+
+%% The response the connection waited for has ended: go on with the input
+%% held behind it.
+resume_actions(#state{held = Held}) when is_binary(Held) ->
+    [{next_event, internal, resume_input}];
+resume_actions(_State) ->
+    [].
 
 %% Close for a cancelled stream. Closing at once would cut the response to
 %% an earlier pipelined request that is still pending, so in that case the
@@ -1827,7 +1867,10 @@ input_pending(StreamId, #state{streams = Streams} = State) ->
             end,
     State#state.unread
         orelse parser_holds_input(State)
+        orelse holds_input(State)
         orelse maps:size(maps:filter(Other, Streams)) > 0.
+
+holds_input(#state{held = Held}) -> is_binary(Held) andalso Held =/= <<>>.
 
 %% Close for a cancelled request. Responses to earlier pipelined requests
 %% are still owed and are read first: the cancelled stream is kept as the
@@ -1899,7 +1942,8 @@ mark_last(Id, #state{streams = Streams} = State) ->
             State1;
         _ ->
             Later = lists:any(fun(K) -> K > Id end, maps:keys(Streams))
-                    orelse parser_holds_input(State1),
+                    orelse parser_holds_input(State1)
+                    orelse holds_input(State1),
             stop_reading(Later, State1)
     end.
 
@@ -2396,8 +2440,11 @@ send_handover_response(Wire, State) ->
 %% `gen_tcp:controlling_process/2' only forwards what is still queued here and
 %% `ssl:controlling_process/2' forwards nothing.
 hand_over_socket({NewOwner, _}, #state{parser = Parser, transport = Transport,
-                                       socket = Socket}) ->
-    Parsed = h1_parse_erl:get(Parser, buffer),
+                                       socket = Socket, held = Held}) ->
+    %% Bytes read after the request (a CONNECT tunnel's first bytes) were
+    %% held behind its response, not parsed: they belong to the new owner.
+    Parsed = [h1_parse_erl:get(Parser, buffer),
+              case Held of undefined -> <<>>; _ -> Held end],
     {Delivered, Events} = drain_socket_messages(Socket, [], []),
     Visible = case {give_socket(Transport, Socket, NewOwner), Events} of
         %% The socket went away without an event, and an active owner still has

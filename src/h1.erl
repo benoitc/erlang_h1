@@ -26,6 +26,10 @@
 %%         h1:send_data(Conn, Id, <<"ok">>, true)
 %%     end}).
 %% '''
+%%
+%% A server connection serves pipelined requests one at a time: the next
+%% request is read only once the response to the current one has ended, so
+%% responses go out in request order (RFC 9112 §9.3.2).
 -module(h1).
 
 %% Client API
