@@ -6,15 +6,6 @@ follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Security
-
-- A client could make a server read and queue any number of pipelined
-  requests while the first one was still being answered, growing the
-  server's memory without bound: 2.8 MB of small pipelined requests made
-  one connection hold about 88 MB. The server now reads the next pipelined
-  request only once the current response has ended, so TCP holds such a
-  client back and a connection holds at most one read of input ahead.
-
 ### Added
 
 - `h1:internal_error/2` answers a request whose handler failed: a 500
@@ -34,6 +25,12 @@ follow [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A client could make a server read and queue any number of pipelined
+  requests while the first one was still being answered, growing the
+  server's memory without bound: 2.8 MB of small pipelined requests made
+  one connection hold about 88 MB. The server now reads the next pipelined
+  request only once the current response has ended, so TCP holds such a
+  client back and a connection holds at most one read of input ahead.
 - Responses to pipelined requests could be written into each other when a
   handler returned before its response had ended, for example by handing
   the rest of the response to another process. Pipelined requests are now
