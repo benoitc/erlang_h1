@@ -4,6 +4,19 @@ All notable changes to this project are documented here. Format loosely
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- A client upgrade (`h1:upgrade/3,4`) never returned when the server
+  refused it with a status other than 101. If the server then closed the
+  connection, as a proxy refusing a tunnel does, the caller failed with a
+  bare "peer closed"; if the server kept the connection open, the caller
+  waited for its timeout. The upgrade now returns an `http_status` error
+  with the status and headers as soon as the refusal arrives, so you can
+  tell, for example, that a proxy answered 403 or 502. The refusal is still
+  delivered as a normal response.
+
 ## [0.13.0] - 2026-11-20
 
 ### Added

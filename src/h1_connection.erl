@@ -1231,13 +1231,23 @@ on_headers_complete(#state{mode = client, current_stream = Id} = State, client) 
                    {informational, Id, Status, Headers}, self()),
             continue_after_informational(State1, Id);
         _ ->
-            State1 = put_stream(Stream1, State),
+            State1 = put_stream(refuse_upgrade(Stream1, Status, Headers), State),
             _ = emit_to_owner_or_handler_lookup(Id,
                 {response, Id, Status, Headers}, State1),
             State2 = apply_peer_connection_policy(State1, Headers,
                         Stream1#stream.version),
             {continue, State2}
     end.
+
+%% A final status other than 101 answers a pending upgrade/3,4: the server
+%% did not switch and the connection stays HTTP/1.1 (RFC 9110 §7.8, §15.2.2).
+%% The caller gets the status now. The response itself is read and delivered
+%% like any other, and its `Connection: close' still closes.
+refuse_upgrade(#stream{upgrade_from = undefined} = Stream, _Status, _Headers) ->
+    Stream;
+refuse_upgrade(#stream{upgrade_from = From} = Stream, Status, Headers) ->
+    gen_statem:reply(From, {error, {http_status, Status, Headers}}),
+    Stream#stream{upgrade_from = undefined}.
 
 on_request_headers_complete(Stream1, Headers, State, Id) ->
     case detect_upgrade(Stream1, State#state.parser, Headers) of
