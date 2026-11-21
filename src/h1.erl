@@ -716,6 +716,21 @@ controlling_process(Conn, Pid) ->
 %% nothing. While the upgrade waits for its answer, h1:request/3,4,5 returns
 %% `{error, upgrade_pending}', since bytes after it would belong to the new
 %% protocol once the server switches (RFC 9110 §7.8).
+%%
+%% When the server refuses with any final status other than 101, this
+%% returns `{error, {http_status, Status, Headers}}' as soon as the status
+%% and headers arrive. The connection stays HTTP/1.1: the owner still gets
+%% the response as `{response, ...}' and `{data, ...}' events, and the
+%% connection closes after it when the server sent `Connection: close'.
+%% Interim 1xx responses keep this waiting for the final status.
+%%
+%% ```
+%% case h1:upgrade(Conn, <<"connect-udp">>, []) of
+%%     {ok, _StreamId, Socket, Buffer, _Headers} -> tunnel(Socket, Buffer);
+%%     {error, {http_status, Status, _Headers}} -> {error, {refused, Status}};
+%%     {error, Reason} -> {error, Reason}
+%% end.
+%% '''
 -spec upgrade(connection(), binary(), headers()) ->
     {ok, stream_id(), term(), binary(), headers()} | {error, term()}.
 upgrade(Conn, Protocol, Headers) ->

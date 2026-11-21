@@ -21,7 +21,11 @@
     http_1_0_upgrade_ignored/1,
     client_upgrade_refused_while_pending/1,
     client_request_refused_while_upgrade_pending/1,
-    client_upgrade_after_responses/1
+    client_upgrade_after_responses/1,
+    client_upgrade_refused_then_closed/1,
+    client_upgrade_refused_kept_open/1,
+    client_upgrade_waits_past_interim/1,
+    upgrade_refused_by_h1_server/1
 ]).
 
 all() ->
@@ -30,7 +34,11 @@ all() ->
      accept_upgrade_dedupes_framing_headers, http_1_0_upgrade_ignored,
      client_upgrade_refused_while_pending,
      client_request_refused_while_upgrade_pending,
-     client_upgrade_after_responses].
+     client_upgrade_after_responses,
+     client_upgrade_refused_then_closed,
+     client_upgrade_refused_kept_open,
+     client_upgrade_waits_past_interim,
+     upgrade_refused_by_h1_server].
 
 init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(h1),
@@ -421,6 +429,126 @@ client_upgrade_after_responses(_Config) ->
     after 5000 -> ct:fail(no_upgrade)
     end,
     gen_tcp:close(Srv).
+
+%% ----------------------------------------------------------------------------
+%% Client upgrade refused by the server
+%% ----------------------------------------------------------------------------
+%%
+%% RFC 9110 §7.8: a server that does not switch answers with a final status
+%% other than 101 and the connection stays HTTP/1.1. upgrade/3,4 returns
+%% `{error, {http_status, Status, Headers}}' as soon as that status arrives,
+%% and the response is still delivered to the owner as for any request.
+
+%% A proxy that refuses the tunnel closes after its answer (RFC 9931). The
+%% caller, here the owner as in masque, gets the status and not
+%% `{shutdown, peer_closed}', and the body is still delivered.
+client_upgrade_refused_then_closed(_Config) ->
+    {Conn, Srv} = raw_client(),
+    Body = <<"no route to target">>,
+    spawn_link(fun() ->
+        _ = recv_until_headers(Srv),
+        ok = gen_tcp:send(Srv, [<<"HTTP/1.1 502 Bad Gateway\r\n"
+                                  "connection: close\r\n"
+                                  "content-length: ">>,
+                                integer_to_binary(byte_size(Body)),
+                                <<"\r\n\r\n">>, Body]),
+        gen_tcp:close(Srv)
+    end),
+    Result = h1:upgrade(Conn, <<"connect-udp">>, []),
+    ?assertMatch({error, {http_status, 502, _}}, Result),
+    {error, {http_status, 502, Hs}} = Result,
+    ?assertEqual(<<"close">>, proplists:get_value(<<"connection">>, Hs)),
+    {Id, 502} = response_event(Conn),
+    ?assertEqual(Body, body_events(Conn, Id)),
+    ?assertMatch({closed, _}, conn_event(Conn)).
+
+%% A server that refuses and keeps the connection open: the caller returns
+%% at once instead of waiting for its timeout. The owner need not read the
+%% refusal body first: a request sent right after is answered on the same
+%% connection, behind the refusal.
+client_upgrade_refused_kept_open(_Config) ->
+    {Conn, Srv} = raw_client(),
+    Test = self(),
+    spawn_link(fun() ->
+        Test ! {upgrade_result, h1:upgrade(Conn, <<"connect-udp">>, [])}
+    end),
+    _ = recv_until_headers(Srv),
+    ok = gen_tcp:send(Srv, <<"HTTP/1.1 403 Forbidden\r\n"
+                             "content-length: 9\r\n\r\nforbidden">>),
+    receive
+        {upgrade_result, Result} ->
+            ?assertMatch({error, {http_status, 403, _}}, Result)
+    after 2000 -> ct:fail(upgrade_not_answered)
+    end,
+    {ok, Next} = h1:request(Conn, <<"GET">>, <<"/next">>, []),
+    Request = recv_until_headers(Srv),
+    ?assertMatch(<<"GET /next HTTP/1.1\r\n", _/binary>>, Request),
+    ok = gen_tcp:send(Srv, <<"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok">>),
+    {Id, 403} = response_event(Conn),
+    ?assertNotEqual(Next, Id),
+    ?assertEqual(<<"forbidden">>, body_events(Conn, Id)),
+    ?assertEqual({Next, 200}, response_event(Conn)),
+    ?assertEqual(<<"ok">>, body_events(Conn, Next)),
+    h1:close(Conn),
+    gen_tcp:close(Srv).
+
+%% An interim 1xx is not the answer to the upgrade: the caller keeps
+%% waiting and returns on the final status.
+client_upgrade_waits_past_interim(_Config) ->
+    {Conn, Srv} = raw_client(),
+    Test = self(),
+    spawn_link(fun() ->
+        Test ! {upgrade_result, h1:upgrade(Conn, <<"connect-udp">>, [])}
+    end),
+    _ = recv_until_headers(Srv),
+    ok = gen_tcp:send(Srv, <<"HTTP/1.1 103 Early Hints\r\n"
+                             "link: </style.css>; rel=preload\r\n\r\n">>),
+    ?assertMatch({informational, _, 103, _}, conn_event(Conn)),
+    receive {upgrade_result, Early} -> ct:fail({returned_on_1xx, Early})
+    after 300 -> ok
+    end,
+    ok = gen_tcp:send(Srv, <<"HTTP/1.1 403 Forbidden\r\n"
+                             "content-length: 0\r\n\r\n">>),
+    receive
+        {upgrade_result, Result} ->
+            ?assertMatch({error, {http_status, 403, _}}, Result)
+    after 2000 -> ct:fail(upgrade_not_answered)
+    end,
+    h1:close(Conn),
+    gen_tcp:close(Srv).
+
+%% End to end: an h1 server handler that answers an upgrade request with a
+%% plain response refuses it, and the h1 client reports that status.
+upgrade_refused_by_h1_server(Config0) ->
+    Handler = fun(Conn, StreamId, _M, _P, _Hs) ->
+        h1:respond(Conn, StreamId, 403, [], <<"forbidden">>)
+    end,
+    Config = start_server(Handler, Config0),
+    Port = h1:server_port(?config(server_ref, Config)),
+    {ok, Conn} = h1:connect("127.0.0.1", Port, #{transport => tcp}),
+    ?assertMatch({error, {http_status, 403, _}},
+                 h1:upgrade(Conn, <<"connect-udp">>,
+                            [{<<"host">>, <<"localhost">>}], 5000)),
+    {Id, 403} = response_event(Conn),
+    ?assertEqual(<<"forbidden">>, body_events(Conn, Id)),
+    h1:close(Conn).
+
+%% The next `{response, ...}' event as `{StreamId, Status}'.
+response_event(Conn) ->
+    case conn_event(Conn) of
+        {response, Id, Status, _Headers} -> {Id, Status};
+        Other -> ct:fail({expected_response, Other})
+    end.
+
+%% The body of stream `Id', read from its data events up to the last one.
+body_events(Conn, Id) ->
+    body_events(Conn, Id, <<>>).
+body_events(Conn, Id, Acc) ->
+    case conn_event(Conn) of
+        {data, Id, Data, false} -> body_events(Conn, Id, <<Acc/binary, Data/binary>>);
+        {data, Id, Data, true} -> <<Acc/binary, Data/binary>>;
+        Other -> ct:fail({expected_data, Id, Other})
+    end.
 
 %% An h1 client connected to a raw server socket held by the test.
 raw_client() ->

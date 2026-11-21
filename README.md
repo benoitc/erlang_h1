@@ -498,6 +498,14 @@ The `Upgrade` / 101 handshake is exposed at the public API. After a successful u
 %% Anything already in Buf was received past the 101 response.
 ```
 
+If the server answers with a final status other than 101, `h1:upgrade/3,4` returns at once with that status. The connection stays HTTP/1.1 and the response still arrives as `{h1, Conn, _}` events:
+
+```erlang
+{error, {http_status, 502, RespHeaders}} =
+    h1:upgrade(Conn, <<"connect-udp">>, []),
+receive {h1, Conn, {response, StreamId, 502, _}} -> ok end.
+```
+
 ### Server accepting an upgrade
 
 The request handler inspects the `Upgrade:` header and calls `accept_upgrade/3` to switch protocols:
@@ -786,6 +794,7 @@ Failures return `{error, Reason}` from API calls or appear as `{closed, Reason}`
 | `pipeline_disabled` | `pipeline => false` and a prior request was still in flight |
 | `requests_pending` | client: `h1:upgrade/3,4` while responses to earlier requests are still arriving |
 | `upgrade_pending` | client: a new request while an upgrade waits for its answer |
+| `{http_status, Status, Headers}` | client: `h1:upgrade/3,4` refused with a final status other than 101 |
 
 ## Using with Ranch
 
