@@ -16,6 +16,7 @@ HTTP/1.1 has no way to end one exchange without ending the connection. So every 
 | `h1:send_goaway/1,2` | the response in progress | server |
 | `max_keepalive_requests` reached (default 100) | the response in progress | server |
 | Your handler answers before the request body has arrived (early response) | that response | server |
+| Your handler answers a `CONNECT` with a response instead of `h1:accept_connect/3,4` (RFC 9931 §8) | that response | server |
 | A malformed or over-limit request is answered with an error status | the error response | server |
 | `h1:cancel/2,3` on a stream, with an earlier pipelined response still owed | that earlier response | server |
 | `h1:cancel/2,3` on a stream, with nothing earlier owed | none: close now | server |
@@ -24,6 +25,8 @@ HTTP/1.1 has no way to end one exchange without ending the connection. So every 
 The close point only moves down. If two events name different streams, the earlier one wins. For example, cancelling requests 2 and 3 in either order closes the client after response 1.
 
 Input that arrives after the last request is read and discarded, never parsed.
+
+A refused `CONNECT` closes even when the request did not ask for it. A client may send tunnel bytes right after the `CONNECT`, before it knows the answer. If the server went on reading, those bytes could form a request that the proxy would serve (request smuggling, RFC 9931 §8).
 
 ## How the server closes
 
@@ -79,5 +82,6 @@ end.
 
 - The close point is the `close_at` field in `h1_connection.erl`. `mark_last/2`, `served/2` and `cancel_due/1` set and read it.
 - `server_close/5` is the only place that chooses between closing at once and staging. `input_pending/2` decides. `enter_lingering_close/3` runs the drain.
-- Tests: `h1_close_SUITE` (last response), `h1_cancel_SUITE` (cancels, handler crashes, the reset during an upload), and the early-response cases in `h1_e2e_SUITE`.
+- A response to a `CONNECT` becomes the last through `last_after_connect/2`, called where a final response is committed.
+- Tests: `h1_close_SUITE` (last response), `h1_cancel_SUITE` (cancels, handler crashes, the reset during an upload), the refused `CONNECT` cases in `h1_connect_SUITE`, and the early-response cases in `h1_e2e_SUITE`.
 - A regression test for a reset must drive a raw `gen_tcp` peer, and must read only after the reset could have arrived. Otherwise the client reads the bytes first and the test passes without the fix. `cancel_during_upload` in `h1_cancel_SUITE` shows the recipe.

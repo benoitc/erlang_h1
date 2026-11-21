@@ -1711,7 +1711,8 @@ handle_send_response(From, StreamId, Status, Headers, State0) ->
             %% If the request body is still incoming, the connection will
             %% close after this response — commit Connection: close now,
             %% before any send_data, so it is in the header block.
-            State0b = maybe_set_early_close(StreamId, State),
+            State0b = last_after_connect(Stream,
+                                         maybe_set_early_close(StreamId, State)),
             {Framing, HeadersWire, Close} =
                 prepare_response(Stream, Status, Headers, no_body, State0b),
             Stream1 = Stream#stream{status = Status, resp_headers = Headers,
@@ -1755,7 +1756,8 @@ handle_respond(From, StreamId, Status, Headers0, Body, Opts, State0) ->
             %% Committing a final response before the request body has been
             %% fully received: advertise Connection: close and linger-close
             %% (RFC 9112 §6.6) so the client reads the response before FIN.
-            State0b = maybe_set_early_close(StreamId, State),
+            State0b = last_after_connect(Stream,
+                                         maybe_set_early_close(StreamId, State)),
             {Framing, HeadersWire, Close} =
                 prepare_response(Stream, Status, Headers0, Body, State0b),
             BodyWire = frame_body(Stream#stream{resp_framing = Framing}, Body, true),
@@ -1789,6 +1791,21 @@ maybe_set_early_close(StreamId, #state{mode = server, streams = Streams} = State
         _ -> State
     end;
 maybe_set_early_close(_StreamId, State) ->
+    State.
+
+%% A CONNECT answered with a response, not with accept_connect/3,4, is the
+%% last request on its connection. A client may send tunnel bytes right
+%% after the CONNECT, and they must never be read as requests (request
+%% smuggling). A final status other than 2xx rejects the tunnel: the server
+%% MUST close the connection without processing any further request, even
+%% when the request did not ask for close (RFC 9931 §8, which updates RFC
+%% 9112). A 2xx tells the client the tunnel is open (RFC 9110 §9.3.6), which
+%% only accept_connect/3,4 does, so it closes the same way. The response
+%% carries `Connection: close' and later input is discarded.
+last_after_connect(#stream{id = Id, method = <<"CONNECT">>},
+                   #state{mode = server} = State) ->
+    mark_last(Id, State);
+last_after_connect(_Stream, State) ->
     State.
 
 %% Decide what to do once a server response (or final body chunk) is flushed.
