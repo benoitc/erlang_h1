@@ -8,6 +8,13 @@ follow [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A server kept the connection open after a handler refused a CONNECT.
+  Bytes the client had sent right after the CONNECT, meant for the tunnel,
+  were then read as new requests, so a client could slip requests to the
+  proxy itself. As RFC 9931 requires, a CONNECT answered with anything
+  other than `h1:accept_connect/3,4` is now the last response on its
+  connection: it says `Connection: close` and nothing after it is read as
+  a request.
 - A client upgrade (`h1:upgrade/3,4`) never returned when the server
   refused it with a status other than 101. If the server then closed the
   connection, as a proxy refusing a tunnel does, the caller failed with a

@@ -62,6 +62,7 @@
 - No `Connection: Upgrade` / `Upgrade:` / `Transfer-Encoding: chunked` headers are injected: bytes past the blank line belong to the tunnel, not to an HTTP response body. Sequencing `send_response/4` + a separate handoff would be wrong because `send_response/4` defaults to chunked framing when no `Content-Length` is set.
 - After a successful `accept_connect`, the `gen_statem` stops with `{shutdown, connected}` and leaves the socket open (owned by the caller). The owner also receives `{h1, Conn, {connected, StreamId, Transport, Socket, Buffer}}`.
 - Error returns: `{error, unknown_stream}` (bogus StreamId), `{error, response_already_sent}` (after `h1:send_response/4` on the same stream), `{error, Reason}` from the underlying `send`.
+- Refusing (RFC 9931 §8): a handler that answers a CONNECT with a response instead of `accept_connect` makes it the last response. It carries `Connection: close`, and the bytes the client sent after the CONNECT are discarded, never parsed as requests, so they cannot be smuggled to the proxy. A 2xx written that way closes too: only `accept_connect` opens a tunnel.
 - Counterpart to `accept_upgrade/3` for the 101 Switching Protocols case. Downstream use: `erlang_masque`'s HTTP/1.1 CONNECT-TCP fallback.
 
 ### Capsules (RFC 9297)

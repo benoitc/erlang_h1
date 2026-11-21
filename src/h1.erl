@@ -763,6 +763,13 @@ accept_upgrade(Conn, StreamId, ExtraHeaders) ->
 %% the 101 Switching Protocols case, but writes status 200 and injects no
 %% Connection/Upgrade headers so bytes after CRLF belong to the tunnel.
 %% The handover guarantees are the same as for `accept_upgrade/3'.
+%%
+%% To refuse the tunnel, answer with a response instead, for example
+%% `h1:respond(Conn, StreamId, 403, [], <<>>)'. That response is the last on
+%% the connection: it carries `Connection: close', and the bytes the client
+%% sent after the CONNECT are discarded, never read as requests (RFC 9931
+%% §8). Any response other than this function closes the same way, a 2xx
+%% included, since only this function opens the tunnel.
 -spec accept_connect(connection(), stream_id(), headers()) ->
     {ok, gen_tcp | ssl, term(), binary()} | {error, term()}.
 accept_connect(Conn, StreamId, ExtraHeaders) ->
